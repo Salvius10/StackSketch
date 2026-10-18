@@ -1,0 +1,31 @@
+{
+  "name": "stacksketch",
+  "private": true,
+  "version": "0.1.0",
+  "description": "StackSketch: an architecture whiteboard with a live AI design reviewer and flow explainer",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "predev": "node scripts/check-ports.mjs",
+    "dev": "concurrently -k -n api,sync,web -c blue,magenta,green \"npm:dev:api\" \"npm:dev:sync\" \"npm:dev:web\"",
+    "dev:web": "npm run dev -w @stacksketch/web",
+    "dev:sync": "npm run dev -w @stacksketch/sync",
+    "dev:api": "cd api && uv run uvicorn stacksketch_api.main:serve --factory --reload --port 8000",
+    "smoke": "cd apps/sync && npx tsx scripts/smoke.ts",
+    "build": "npm run build -w @stacksketch/web",
+    "test": "npm test -w @stacksketch/graph && npm test -w @stacksketch/sync && cd api && uv run pytest -q",
+    "typecheck": "npm run typecheck --workspaces --if-present"
+  },
+  "engines": {
+    "node": ">=22.13"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "concurrently": "^10.0.6",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3",
+    "vitest": "^5.0.5"
+  }
+}

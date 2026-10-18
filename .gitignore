@@ -1,0 +1,12 @@
+node_modules/
+.next/
+dist/
+*.tsbuildinfo
+.env
+.env.local
+data/
+__pycache__/
+.venv/
+.pytest_cache/
+*.pyc
+api/spike/results/
