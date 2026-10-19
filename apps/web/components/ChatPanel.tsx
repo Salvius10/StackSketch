@@ -8,10 +8,15 @@ interface Props {
   status: { state: "idle" | "thinking" } | null;
   llmAvailable: boolean;
   meName: string;
+  /** This browser tab: it applies the edits the AI made for its own messages. */
+  tabId: string;
   onSend: (text: string, askAi: boolean) => void;
+  onApply: (m: ChatMessage) => void;
+  onUndo: (m: ChatMessage) => void;
+  onShow: (m: ChatMessage) => void;
 }
 
-export function ChatPanel({ messages, status, llmAvailable, meName, onSend }: Props) {
+export function ChatPanel({ messages, status, llmAvailable, meName, tabId, onSend, onApply, onUndo, onShow }: Props) {
   const [text, setText] = useState("");
   const [askAi, setAskAi] = useState(true);
   const end = useRef<HTMLDivElement>(null);
@@ -27,13 +32,73 @@ export function ChatPanel({ messages, status, llmAvailable, meName, onSend }: Pr
     setText("");
   };
 
+  /** The line under an AI reply that changed the board: what it did, and undo or apply. */
+  const edits = (m: ChatMessage) => {
+    if (!m.edits || !m.edit_state) return null;
+    const mine = messages.find((q) => q.id === m.reply_to)?.tab === tabId;
+    switch (m.edit_state) {
+      case "proposed":
+        return mine ? (
+          <div className="msg-edits">
+            <span className="spinner" /> Drawing on the board…
+          </div>
+        ) : (
+          <div className="msg-edits">
+            <span>Changes for the board</span>
+            <button className="btn small" type="button" onClick={() => onApply(m)}>
+              Apply
+            </button>
+          </div>
+        );
+      case "applied":
+        return (
+          <div className="msg-edits">
+            <span>✓ {m.edit_note}</span>
+            <span className="msg-edit-actions">
+              {(m.edit_ids?.length ?? 0) > 0 && (
+                <button className="btn small ghost" type="button" onClick={() => onShow(m)}>
+                  Show
+                </button>
+              )}
+              <button className="btn small" type="button" onClick={() => onUndo(m)}>
+                Undo
+              </button>
+            </span>
+          </div>
+        );
+      case "undone":
+        return (
+          <div className="msg-edits">
+            <span>Undone.</span>
+            <button className="btn small" type="button" onClick={() => onApply(m)}>
+              Apply again
+            </button>
+          </div>
+        );
+      case "failed":
+        return (
+          <div className="msg-edits failed">
+            <span>Could not change the board: {m.edit_note}</span>
+            <button className="btn small" type="button" onClick={() => onApply(m)}>
+              Try again
+            </button>
+          </div>
+        );
+    }
+  };
+
   return (
     <div className="panel-body chat">
       <p className="fine">
-        One thread for the whole room. The AI reads the same graph and findings everyone sees.
+        One thread for the whole room. The AI reads the same graph and findings everyone sees, and can change the board when you ask it to.
       </p>
       <div className="chat-list">
-        {messages.length === 0 && <p className="empty">No messages yet. Ask the AI why a finding matters, or how a flow should work.</p>}
+        {messages.length === 0 && (
+          <p className="empty">
+            No messages yet. Ask the AI why a finding matters, or to change the design: &ldquo;add a Redis cache in front of the database&rdquo;, &ldquo;fix the
+            findings&rdquo;, &ldquo;draw a serverless image pipeline&rdquo;.
+          </p>
+        )}
         {messages.map((m) => (
           <div key={m.id} className={`msg ${m.role}${m.author === meName ? " mine" : ""}`}>
             <div className="msg-author">
@@ -41,6 +106,7 @@ export function ChatPanel({ messages, status, llmAvailable, meName, onSend }: Pr
               {m.status === "pending" && <span className="fine"> · waiting for AI</span>}
             </div>
             <div className="msg-text">{m.text}</div>
+            {edits(m)}
             {m.status === "error" && <div className="error">AI could not answer: {m.error}</div>}
           </div>
         ))}

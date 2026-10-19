@@ -1,9 +1,9 @@
 // Connector geometry, shared by the canvas and the SVG export so both draw the
-// same lines: right-angle paths between the sides of two components, or the
-// route an auto-layout found, fitted to where the ends are now.
+// same lines: right-angle paths between the sides of two shapes (or the route an
+// auto-layout found, fitted to where the ends are now), straight lines or curves.
 
-import { getSmoothStepPath, Position } from "@xyflow/react";
-import type { Box, Point, Side } from "@stacksketch/graph";
+import { getBezierPath, getSmoothStepPath, Position } from "@xyflow/react";
+import type { Box, LineStyle, Point, Side } from "@stacksketch/graph";
 
 export const SIDE_POSITION: Record<Side, Position> = {
   top: Position.Top,
@@ -57,14 +57,27 @@ export function polyline(points: Point[]): { path: string; mid: Point } {
   return { path, mid: points[0] };
 }
 
-/** The path a connector takes between two handle points. */
+/** The path a connector takes between two handle points: right-angled (or its stored route), straight or curved. */
 export function connectorPath(
   start: Point,
   startSide: Side,
   end: Point,
   endSide: Side,
   route?: Point[] | null,
+  line: LineStyle = "orthogonal",
 ): { path: string; mid: Point } {
+  if (line === "straight") return polyline([start, end]);
+  if (line === "curved") {
+    const [path, x, y] = getBezierPath({
+      sourceX: start.x,
+      sourceY: start.y,
+      sourcePosition: SIDE_POSITION[startSide],
+      targetX: end.x,
+      targetY: end.y,
+      targetPosition: SIDE_POSITION[endSide],
+    });
+    return { path, mid: { x, y } };
+  }
   if (route && route.length > 2) return polyline(fitRoute(route, start, end));
   const [path, x, y] = getSmoothStepPath({
     sourceX: start.x,

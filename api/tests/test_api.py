@@ -5,7 +5,8 @@ from types import SimpleNamespace
 import httpx
 from fastapi.testclient import TestClient
 
-from stacksketch_api.llm import DEFAULT_MODELS, LLM, GenEdge, GenGraph, GenNode, Judgement, Narration, RefineOutput, Rewrite
+from stacksketch_api.llm import DEFAULT_MODELS, LLM, ChatOutput, GenEdge, GenGraph, GenNode, Judgement, Narration, RefineOutput, Rewrite, clean_edits
+from stacksketch_api.models import BoardEdits, EdgeChange, NewEdge, NewGroup, NewNode, NodeChange
 from stacksketch_api.main import create_app, serve
 
 
@@ -20,10 +21,6 @@ class FakeMessages:
         self.calls.append(kwargs)
         out = self.outputs[kwargs["output_format"]]
         return SimpleNamespace(stop_reason="end_turn", parsed_output=out)
-
-    async def create(self, **kwargs):
-        self.calls.append(kwargs)
-        return SimpleNamespace(stop_reason="end_turn", content=[SimpleNamespace(type="text", text="Order Service is the bottleneck.")])
 
 
 def fake_llm(outputs) -> tuple[LLM, FakeMessages]:
@@ -141,12 +138,107 @@ def test_generate_and_narrate(shop):
 
 
 def test_chat(shop):
-    llm, messages = fake_llm({})
+    llm, messages = fake_llm({ChatOutput: ChatOutput(reply="Order Service is the bottleneck.", edits=BoardEdits())})
     client = TestClient(create_app(llm))
     r = client.post("/chat", json={"graph": graph_json(shop), "messages": [{"role": "user", "author": "Mel", "text": "Where is the bottleneck?"}]})
-    assert r.json() == {"reply": "Order Service is the bottleneck.", "llm": True}
+    assert r.json() == {"reply": "Order Service is the bottleneck.", "llm": True, "edits": None}
     sent = messages.calls[0]["messages"]
     assert sent[-1] == {"role": "user", "content": "Mel: Where is the bottleneck?"}
+
+
+def test_chat_edits_the_board(shop):
+    """The model's edits come back checked against the graph."""
+    edits = BoardEdits(
+        add_nodes=[NewNode(id="orders-dlq", type="queue", label="Orders DLQ", tech="Kafka", zone=None)],
+        update_nodes=[NodeChange(id="order-svc", label=None, type=None, tech=None, replicas=2, dlq=None)],
+        add_edges=[NewEdge(from_node="orders-topic", to_node="orders-dlq", kind="async", protocol=None, endpoint="order.failed", retry=None, timeout_ms=None, hot_path=None)],
+    )
+    llm, messages = fake_llm({ChatOutput: ChatOutput(reply="Added a DLQ and a second Order Service replica.", edits=edits)})
+    zones = [{"label": "Backend", "members": ["order-svc", "orders-db"]}]
+    history = [
+        {"role": "user", "author": "Mel", "text": "Hi"},
+        {"role": "assistant", "text": "Hello."},
+        {"role": "user", "author": "Mel", "text": "Fix the findings"},
+    ]
+    body = TestClient(create_app(llm)).post("/chat", json={"graph": graph_json(shop), "zones": zones, "messages": history}).json()
+    assert body["reply"].startswith("Added a DLQ")
+    assert body["edits"]["add_nodes"][0]["id"] == "orders-dlq" and body["edits"]["add_edges"][0]["to_node"] == "orders-dlq"
+    assert body["edits"]["update_nodes"][0]["replicas"] == 2
+    call = messages.calls[0]
+    assert call["output_format"] is ChatOutput
+    assert '"label": "Backend"' in call["messages"][0]["content"]
+    assert [m["role"] for m in call["messages"]] == ["user", "assistant", "user", "assistant", "user"]
+    assert call["messages"][-1]["content"] == "Mel: Fix the findings"
+
+
+def test_chat_says_when_its_edits_change_nothing(shop):
+    already = BoardEdits(update_nodes=[NodeChange(id="orders-db", label=None, type=None, tech="Postgres", replicas=2, dlq=None)])
+    llm, _ = fake_llm({ChatOutput: ChatOutput(reply="Gave Orders DB a replica.", edits=already)})
+    body = TestClient(create_app(llm)).post("/chat", json={"graph": graph_json(shop), "messages": [{"role": "user", "text": "fix it"}]}).json()
+    assert body["edits"] is None and body["reply"].startswith("Gave Orders DB a replica.\n\n(Nothing on the board changed")
+
+
+def test_clean_edits(shop):
+    edits = BoardEdits(
+        add_nodes=[
+            NewNode(id="Order Service", type="service", label="Order Service v2", tech=" ", zone=" "),
+            NewNode(id="blank", type="cache", label="  ", tech=None, zone=None),
+        ],
+        update_nodes=[
+            NodeChange(id="nope", label="X", type=None, tech=None, replicas=None, dlq=None),
+            NodeChange(id="web", label=None, type=None, tech=None, replicas=None, dlq=None),
+            NodeChange(id="stripe", label="Stripe API", type=None, tech=None, replicas=None, dlq=None),
+            NodeChange(id="api-gw", label=None, type=None, tech=None, replicas=-1, dlq=None),
+            # Repeats what is there, and gives a service a dead-letter queue: only the replicas are news.
+            NodeChange(id="order-svc", label="Order Service", type="service", tech="FastAPI", replicas=3, dlq=True),
+        ],
+        remove_nodes=["stripe", "ghost"],
+        add_edges=[
+            NewEdge(from_node="api-gw", to_node="Order Service", kind="sync", protocol=None, endpoint=None, retry=None, timeout_ms=-5, hot_path=None),
+            NewEdge(from_node="web", to_node="api-gw", kind="sync", protocol=None, endpoint=None, retry=None, timeout_ms=None, hot_path=None),
+            NewEdge(from_node="web", to_node="stripe", kind="sync", protocol=None, endpoint=None, retry=None, timeout_ms=None, hot_path=None),
+            NewEdge(from_node="web", to_node="web", kind="sync", protocol=None, endpoint=None, retry=None, timeout_ms=None, hot_path=None),
+            # The reply to an existing sync call, and a "sync" hop into a queue.
+            NewEdge(from_node="orders-db", to_node="order-svc", kind="sync", protocol=None, endpoint=None, retry=None, timeout_ms=None, hot_path=None),
+            NewEdge(from_node="inventory-svc", to_node="orders-topic", kind="sync", protocol=None, endpoint=None, retry=None, timeout_ms=None, hot_path=None),
+        ],
+        update_edges=[
+            EdgeChange(id="order-svc->stripe", kind=None, protocol=None, endpoint=None, retry=None, timeout_ms=2000, hot_path=None),
+            EdgeChange(id="order-svc->orders-db", kind=None, protocol=None, endpoint=None, retry=None, timeout_ms=None, hot_path=None),
+            EdgeChange(id="order-svc->inventory-svc", kind=None, protocol=None, endpoint=None, retry=None, timeout_ms=800, hot_path=None),
+            EdgeChange(id="api-gw->order-svc", kind="sync", protocol="REST", endpoint="POST /orders", retry=None, timeout_ms=None, hot_path=None),
+        ],
+        remove_edges=["order-svc->inventory-svc", "missing->edge"],
+        groups=[NewGroup(label="", members=["Order Service", "orders-db", "stripe", "ghost"]), NewGroup(label="Empty", members=["ghost"])],
+    )
+    out = clean_edits(shop, edits)
+    # A new node never takes an existing id, and edges to it follow the rename.
+    assert [(n.id, n.label, n.tech, n.zone) for n in out.add_nodes] == [("order-service", "Order Service v2", None, None)]
+    assert [(e.from_node, e.to_node, e.kind, e.timeout_ms) for e in out.add_edges] == [
+        ("api-gw", "order-service", "sync", None),
+        ("inventory-svc", "orders-topic", "async", None),
+    ]
+    assert out.remove_nodes == ["stripe"]
+    # No edits to unknown or removed nodes, and only the fields that change.
+    assert [n.model_dump() for n in out.update_nodes] == [{"id": "order-svc", "label": None, "type": None, "tech": None, "replicas": 3, "dlq": None}]
+    # Edges to a removed node, removed edges and empty changes go.
+    assert [(e.id, e.kind, e.protocol, e.endpoint) for e in out.update_edges] == [("api-gw->order-svc", None, None, "POST /orders")]
+    assert out.remove_edges == ["order-svc->inventory-svc"]
+    assert [(g.label, g.members) for g in out.groups] == [("Group", ["order-service", "orders-db"])]
+    assert BoardEdits().is_empty() and not out.is_empty()
+
+
+def test_clean_edits_drops_unasked_guesses(shop):
+    """Retry, timeout and hot-path values stay only when the team or a finding brought them up."""
+    guess = NewEdge(from_node="inventory-svc", to_node="orders-topic", kind="async", protocol="Kafka", endpoint=None, retry=True, timeout_ms=50, hot_path=False)
+    change = EdgeChange(id="order-svc->stripe", kind=None, protocol=None, endpoint=None, retry=True, timeout_ms=2000, hot_path=None)
+    edits = BoardEdits(add_edges=[guess], update_edges=[change])
+    out = clean_edits(shop, edits, "add a queue between inventory and orders")
+    assert (out.add_edges[0].protocol, out.add_edges[0].retry, out.add_edges[0].timeout_ms, out.add_edges[0].hot_path) == ("Kafka", None, None, None)
+    assert out.update_edges == []
+    out = clean_edits(shop, edits, "Stripe call has no timeout. Set a timeout of 2s.")
+    assert out.add_edges[0].timeout_ms == 50 and out.add_edges[0].retry is None
+    assert [(e.timeout_ms, e.retry) for e in out.update_edges] == [(2000, None)]
 
 
 def test_openrouter_structured_output(shop):
@@ -189,10 +281,13 @@ def test_openrouter_failures_become_503(shop):
 
 
 def test_openrouter_chat(shop):
-    llm, sent = openrouter_llm(lambda body: completion("Order Service is the bottleneck."))
+    out = ChatOutput(reply="Order Service is the bottleneck.", edits=BoardEdits())
+    llm, sent = openrouter_llm(lambda body: completion(out.model_dump_json()))
     r = TestClient(create_app(llm)).post("/chat", json={"graph": graph_json(shop), "messages": [{"role": "user", "author": "Mel", "text": "Where is the bottleneck?"}]})
-    assert r.json() == {"reply": "Order Service is the bottleneck.", "llm": True}
-    assert "response_format" not in sent[0]
+    assert r.json() == {"reply": "Order Service is the bottleneck.", "llm": True, "edits": None}
+    fmt = sent[0]["response_format"]["json_schema"]
+    assert fmt["name"] == "ChatOutput" and "$ref" not in json.dumps(fmt["schema"])
+    assert fmt["schema"]["properties"]["edits"]["properties"]["add_nodes"]["items"]["required"] == ["id", "type", "label", "tech", "zone"]
     assert sent[0]["messages"][0]["role"] == "system" and sent[0]["messages"][-1] == {"role": "user", "content": "Mel: Where is the bottleneck?"}
 
 

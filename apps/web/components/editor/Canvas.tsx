@@ -1,17 +1,20 @@
 "use client";
 
-// The diagram canvas: React Flow wired to the shared model. Drag components in
-// from the library (into a zone if you drop them on one), connect them by
-// dragging from a connection point onto another component, drag things in and
-// out of zones, double-click to rename. Teammates' cursors and selections show live.
+// The diagram canvas: React Flow wired to the shared model. Drag shapes and
+// components in from the library (into a zone if you drop them on one), connect
+// them by dragging from a connection point onto another, drag things in and out
+// of zones, double-click to edit text. Teammates' cursors and selections show live.
 
 import {
+  type ConnectorStyle,
+  type Diagram,
   type DiagramEdge,
   type DiagramNode,
-  type EdgeKind,
   type Side,
   absoluteBox,
   newDiagramId,
+  rowsLayout,
+  shapeDef,
   sidesBetween,
 } from "@stacksketch/graph";
 import {
@@ -22,7 +25,6 @@ import {
   ConnectionMode,
   type EdgeChange,
   type FinalConnectionState,
-  MarkerType,
   MiniMap,
   type NodeChange,
   ReactFlow,
@@ -30,26 +32,35 @@ import {
   ViewportPortal,
   applyEdgeChanges,
   applyNodeChanges,
+  getViewportForBounds,
   useReactFlow,
   useStore,
 } from "@xyflow/react";
-import "@xyflow/react/dist/style.css";
 import { type MutableRefObject, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { GRID, addConnected, reparentAfterDrag, snap, zoneAt } from "@/lib/arrange";
+import { GRID, addConnected, connectable, contentBounds, footprint, insertDiagram, putInside, reparentAfterDrag, snap, union, zoneAt } from "@/lib/arrange";
 import type { DiagramModel } from "@/lib/diagram";
-import { DRAG_MIME, LIBRARY, type LibraryItem, itemByKey, itemIcon, nodeFromItem } from "@/lib/library";
+import { DRAG_MIME, LIBRARIES, type LibraryItem, SCRATCH_MIME, componentIcon, itemPreview, itemSize, libraryItem, nodeFromItem } from "@/lib/library";
 import type { Peer } from "@/lib/useBoard";
 import { EditorContext, type EditorContextValue } from "./context";
 import { type FlowEdge, edgeTypes } from "./edges";
 import { type FlowNode, nodeTypes } from "./nodes";
 
+const MIN_ZOOM = 0.15;
+const MAX_ZOOM = 3;
+
 export interface CanvasHandle {
-  fit(): void;
+  /** Fit the whole diagram in view, zooming in no further than `maxZoom`. */
+  fit(maxZoom?: number): void;
   zoomIn(): void;
   zoomOut(): void;
   zoomTo(zoom: number): void;
   /** Scroll so these elements are in view. */
   reveal(ids: string[]): void;
+  /**
+   * Keep these components in view, leaving `bottom` pixels clear at the foot of the
+   * canvas; with `fit`, frame them as large as reads well.
+   */
+  follow(ids: string[], options?: { fit?: boolean; bottom?: number }): void;
   /** Select these elements (now, or as soon as they arrive from the document). */
   select(ids: string[]): void;
   /** The canvas point at the middle of the view. */
@@ -59,11 +70,14 @@ export interface CanvasHandle {
 
 interface Props {
   model: DiagramModel;
-  connectorKind: EdgeKind;
+  /** What connectors drawn now look like. */
+  connector: ConnectorStyle;
+  /** A connector style was dropped from the library. */
+  onConnectorItem(item: LibraryItem): void;
   grid: boolean;
   minimap: boolean;
   dark: boolean;
-  overlay: Pick<EditorContextValue, "pins" | "asked" | "unsure" | "remoteSelection" | "hop" | "onPin">;
+  overlay: Pick<EditorContextValue, "pins" | "asked" | "unsure" | "remoteSelection" | "flow" | "onPin">;
   peers: Peer[];
   onSelection(selection: { nodes: string[]; edges: string[] }): void;
   onPointer(point: { x: number; y: number } | null): void;
@@ -71,14 +85,53 @@ interface Props {
   handleRef: MutableRefObject<CanvasHandle | null>;
 }
 
-const INK = { light: "#232f3e", dark: "#c9d1d9" };
 const SELECT = "#1a73e8";
 const OPPOSITE: Record<Side, Side> = { top: "bottom", bottom: "top", left: "right", right: "left" };
+
+/** What "add and connect" offers after a connection from a shape is dropped on empty canvas. */
+const INSERT_SHAPES = [
+  "general:rectangle",
+  "general:rounded-rectangle",
+  "general:ellipse",
+  "flowchart:decision",
+  "flowchart:terminator",
+  "flowchart:data",
+  "general:process",
+  "general:document",
+  "general:cylinder",
+  "general:hexagon",
+  "general:cloud",
+  "general:note",
+];
 
 function depthOf(n: DiagramNode, byId: Map<string, DiagramNode>): number {
   let d = 0;
   for (let p = n.parent ? byId.get(n.parent) : undefined; p && d < 50; p = p.parent ? byId.get(p.parent) : undefined) d++;
   return d;
+}
+
+/** Stacking on the canvas: zones at the back, then everything else by its z. */
+const zIndexOf = (n: DiagramNode) => (n.kind === "zone" ? 0 : Math.max(1, 10 + Math.min(n.z ?? 0, 1000)));
+
+/** What to offer after a connection from `from` is dropped on empty canvas. */
+function insertChoices(from: DiagramNode | undefined): LibraryItem[] {
+  if (from?.kind === "shape") return INSERT_SHAPES.map((k) => libraryItem(k)).filter((i): i is LibraryItem => !!i);
+  return LIBRARIES.find((l) => l.id === "architecture")!.items.filter((i) => i.kind === "component");
+}
+
+function ItemThumb({ item }: { item: LibraryItem }) {
+  if (item.kind === "component") return <img src={componentIcon(item)} alt="" width={28} height={28} />;
+  const svg = itemPreview(item);
+  return svg ? <span className="ss-thumb-box" dangerouslySetInnerHTML={{ __html: svg }} /> : null;
+}
+
+/** A new node for an item, centred on a canvas point, inside the zone there. */
+function placeItem(item: LibraryItem, point: { x: number; y: number }, diagram: Diagram, byId: Map<string, DiagramNode>): DiagramNode | null {
+  const size = itemSize(item);
+  const topLeft = { x: snap(point.x - size.w / 2), y: snap(point.y - (item.kind === "zone" ? 20 : size.h / 2)) };
+  const zone = zoneAt(point, diagram);
+  const zoneBox = zone ? absoluteBox(zone, byId) : null;
+  return nodeFromItem(item, zoneBox ? { x: topLeft.x - zoneBox.x, y: topLeft.y - zoneBox.y } : topLeft, zone?.id ?? null);
 }
 
 export function Canvas(props: Props) {
@@ -89,7 +142,7 @@ export function Canvas(props: Props) {
   );
 }
 
-function CanvasInner({ model, connectorKind, grid, minimap, dark, overlay, peers, onSelection, onPointer, onZoom, handleRef }: Props) {
+function CanvasInner({ model, connector, onConnectorItem, grid, minimap, dark, overlay, peers, onSelection, onPointer, onZoom, handleRef }: Props) {
   const { diagram, byId, actions } = model;
   const flow = useReactFlow<FlowNode, FlowEdge>();
   const [nodes, setNodes] = useState<FlowNode[]>([]);
@@ -103,19 +156,24 @@ function CanvasInner({ model, connectorKind, grid, minimap, dark, overlay, peers
 
   // --- model -> view ------------------------------------------------------------------------
   useEffect(() => {
+    // Updaters must stay pure (React may run them twice), so read the pending selection here.
+    const pending = new Set(pendingSelect.current);
+    for (const d of diagram.nodes) pendingSelect.current.delete(d.id);
     setNodes((prev) => {
       const old = new Map(prev.map((n) => [n.id, n]));
+      // Parents before children (React Flow needs that), then back to front.
       const ordered = diagram.nodes.slice().sort((a, b) => {
         const za = a.kind === "zone" ? 0 : 1;
         const zb = b.kind === "zone" ? 0 : 1;
-        return za - zb || depthOf(a, byId) - depthOf(b, byId);
+        if (za !== zb) return za - zb;
+        if (za === 0) return depthOf(a, byId) - depthOf(b, byId) || (a.z ?? 0) - (b.z ?? 0);
+        return (a.z ?? 0) - (b.z ?? 0) || depthOf(a, byId) - depthOf(b, byId);
       });
       return ordered.map((d): FlowNode => {
         const was = old.get(d.id);
         const parentId = d.parent && byId.has(d.parent) ? d.parent : undefined;
         const sized = d.kind === "component" ? {} : { width: d.w ?? 200, height: d.h ?? 120 };
-        const selected = was?.selected ?? pendingSelect.current.has(d.id);
-        pendingSelect.current.delete(d.id);
+        const selected = was?.selected ?? pending.has(d.id);
         return {
           id: d.id,
           type: d.kind,
@@ -123,7 +181,7 @@ function CanvasInner({ model, connectorKind, grid, minimap, dark, overlay, peers
           data: { node: d },
           ...(parentId ? { parentId } : {}),
           ...sized,
-          zIndex: d.kind === "zone" ? 0 : 10,
+          zIndex: zIndexOf(d),
           selected,
           ...(was?.measured ? { measured: was.measured } : {}),
           ...(was?.dragging ? { dragging: true } : {}),
@@ -133,14 +191,14 @@ function CanvasInner({ model, connectorKind, grid, minimap, dark, overlay, peers
   }, [diagram.nodes, byId]);
 
   useEffect(() => {
-    const ink = dark ? INK.dark : INK.light;
+    const pending = new Set(pendingSelect.current);
+    for (const e of diagram.edges) pendingSelect.current.delete(e.id);
     setEdges((prev) => {
       const old = new Map(prev.map((e) => [e.id, e]));
       return diagram.edges
-        .filter((e) => byId.get(e.source)?.kind === "component" && byId.get(e.target)?.kind === "component")
+        .filter((e) => connectable(byId.get(e.source)) && connectable(byId.get(e.target)))
         .map((e): FlowEdge => {
-          const selected = old.get(e.id)?.selected ?? pendingSelect.current.has(e.id);
-          pendingSelect.current.delete(e.id);
+          const selected = old.get(e.id)?.selected ?? pending.has(e.id);
           let { sourceSide, targetSide } = e;
           if (!sourceSide || !targetSide) {
             const [s, t] = sidesBetween(absoluteBox(byId.get(e.source)!, byId), absoluteBox(byId.get(e.target)!, byId));
@@ -157,11 +215,10 @@ function CanvasInner({ model, connectorKind, grid, minimap, dark, overlay, peers
             data: { edge: e },
             selected,
             zIndex: 5,
-            markerEnd: { type: MarkerType.ArrowClosed, width: 16, height: 16, color: selected ? SELECT : ink },
           };
         });
     });
-  }, [diagram.edges, byId, dark]);
+  }, [diagram.edges, byId]);
 
   // Show the drawing the first time it arrives.
   useEffect(() => {
@@ -203,12 +260,12 @@ function CanvasInner({ model, connectorKind, grid, minimap, dark, overlay, peers
       if (source === target) return;
       const a = byId.get(source);
       const b = byId.get(target);
-      if (a?.kind !== "component" || b?.kind !== "component") return;
+      if (!connectable(a) || !connectable(b)) return;
       const [s, t] = sidesBetween(absoluteBox(a, byId), absoluteBox(b, byId));
-      const edge: DiagramEdge = { id: newDiagramId(), source, target, sourceSide: sourceSide ?? s, targetSide: targetSide ?? t, kind: connectorKind };
+      const edge: DiagramEdge = { id: newDiagramId(), source, target, ...connector, sourceSide: sourceSide ?? s, targetSide: targetSide ?? t };
       actions.put({ edges: [edge] });
     },
-    [actions, byId, connectorKind],
+    [actions, byId, connector],
   );
 
   const onConnect = useCallback(
@@ -245,18 +302,30 @@ function CanvasInner({ model, connectorKind, grid, minimap, dark, overlay, peers
   const insertConnected = (item: LibraryItem) => {
     if (!insert) return;
     const from = byId.get(insert.from);
-    const at = { x: snap(insert.at.x - 32), y: snap(insert.at.y - 32) };
-    const zone = zoneAt({ x: insert.at.x, y: insert.at.y }, diagram);
-    const zoneBox = zone ? absoluteBox(zone, byId) : null;
-    const node = nodeFromItem(item, zoneBox ? { x: at.x - zoneBox.x, y: at.y - zoneBox.y } : at, zone?.id ?? null);
+    const node = placeItem(item, insert.at, diagram, byId);
+    if (!node) return;
     const edges: DiagramEdge[] = from
-      ? [{ id: newDiagramId(), source: from.id, target: node.id, sourceSide: insert.side, targetSide: OPPOSITE[insert.side], kind: connectorKind }]
+      ? [{ id: newDiagramId(), source: from.id, target: node.id, ...connector, sourceSide: insert.side, targetSide: OPPOSITE[insert.side] }]
       : [];
-    actions.put({ nodes: [node], edges });
+    putInside([node], edges, diagram, actions);
     setInsert(null);
     pendingSelect.current = new Set([node.id]);
+    setNodes((nds) => nds.map((n) => (n.selected ? { ...n, selected: false } : n)));
     setEditingId(node.id);
   };
+
+  // React Flow re-reports the selection whenever this callback changes, so keep it stable.
+  // As in draw.io: a plain click (no drag) on one of several selected shapes selects just that one.
+  const onNodeClick = useCallback((event: React.MouseEvent, node: FlowNode) => {
+    if (event.shiftKey || event.ctrlKey || event.metaKey) return;
+    setNodes((nds) => (nds.some((n) => n.selected && n.id !== node.id) ? nds.map((n) => (n.selected !== (n.id === node.id) ? { ...n, selected: n.id === node.id } : n)) : nds));
+    setEdges((eds) => (eds.some((e) => e.selected) ? eds.map((e) => (e.selected ? { ...e, selected: false } : e)) : eds));
+  }, []);
+
+  const onSelectionChange = useCallback(
+    ({ nodes: ns, edges: es }: { nodes: FlowNode[]; edges: FlowEdge[] }) => onSelection({ nodes: ns.map((n) => n.id), edges: es.map((e) => e.id) }),
+    [onSelection],
+  );
 
   const onReconnect = useCallback(
     (old: FlowEdge, c: Connection) => {
@@ -291,27 +360,42 @@ function CanvasInner({ model, connectorKind, grid, minimap, dark, overlay, peers
 
   // --- the shape library drops here -----------------------------------------------------------
   const onDragOver = useCallback((event: React.DragEvent) => {
-    if (!event.dataTransfer.types.includes(DRAG_MIME)) return;
+    if (!event.dataTransfer.types.includes(DRAG_MIME) && !event.dataTransfer.types.includes(SCRATCH_MIME)) return;
     event.preventDefault();
     event.dataTransfer.dropEffect = "copy";
   }, []);
 
   const onDrop = useCallback(
     (event: React.DragEvent) => {
-      const item = itemByKey.get(event.dataTransfer.getData(DRAG_MIME));
+      const point = flow.screenToFlowPosition({ x: event.clientX, y: event.clientY });
+      const deselect = () => setNodes((nds) => nds.map((n) => (n.selected ? { ...n, selected: false } : n)));
+      const scratch = event.dataTransfer.getData(SCRATCH_MIME);
+      if (scratch) {
+        // A scratchpad entry, centred where it's dropped.
+        event.preventDefault();
+        let clip: Diagram;
+        try {
+          clip = JSON.parse(scratch) as Diagram;
+        } catch {
+          return;
+        }
+        const b = union(clip.nodes.filter((n) => !n.parent).map((n) => ({ x: n.x, y: n.y, width: n.w ?? 64, height: n.h ?? 64 })));
+        if (!b) return;
+        pendingSelect.current = new Set(insertDiagram(clip, model.current(), actions, { x: point.x - b.width / 2, y: point.y - b.height / 2 }));
+        deselect();
+        return;
+      }
+      const item = libraryItem(event.dataTransfer.getData(DRAG_MIME));
       if (!item) return;
       event.preventDefault();
-      const point = flow.screenToFlowPosition({ x: event.clientX, y: event.clientY });
-      const size = item.kind === "component" ? { w: 64, h: 64 } : item.kind === "zone" ? { w: 360, h: 240 } : { w: 200, h: 64 };
-      const topLeft = { x: snap(point.x - size.w / 2), y: snap(point.y - (item.kind === "zone" ? 20 : size.h / 2)) };
-      const zone = zoneAt(point, diagram);
-      const zoneBox = zone ? absoluteBox(zone, byId) : null;
-      const node = nodeFromItem(item, zoneBox ? { x: topLeft.x - zoneBox.x, y: topLeft.y - zoneBox.y } : topLeft, zone?.id ?? null);
-      actions.put({ nodes: [node] });
+      if (item.kind === "connector") return onConnectorItem(item);
+      const node = placeItem(item, point, diagram, byId);
+      if (!node) return;
+      putInside([node], [], diagram, actions);
       pendingSelect.current = new Set([node.id]);
-      setNodes((nds) => nds.map((n) => (n.selected ? { ...n, selected: false } : n)));
+      deselect();
     },
-    [actions, byId, diagram, flow],
+    [actions, byId, diagram, flow, model, onConnectorItem],
   );
 
   // --- presence -----------------------------------------------------------------------------
@@ -326,7 +410,12 @@ function CanvasInner({ model, connectorKind, grid, minimap, dark, overlay, peers
   // --- imperative handle for the menus and toolbar --------------------------------------------
   useEffect(() => {
     handleRef.current = {
-      fit: () => flow.fitView({ padding: 0.15, duration: 250 }),
+      // From the model rather than the rendered nodes, so what was just added counts.
+      fit: (maxZoom = MAX_ZOOM) => {
+        const bounds = contentBounds(model.current());
+        const rect = wrapper.current?.getBoundingClientRect();
+        if (bounds && rect) void flow.setViewport(getViewportForBounds(bounds, rect.width, rect.height, MIN_ZOOM, maxZoom, 0.1), { duration: 250 });
+      },
       zoomIn: () => flow.zoomIn({ duration: 150 }),
       zoomOut: () => flow.zoomOut({ duration: 150 }),
       zoomTo: (z) => flow.zoomTo(z, { duration: 150 }),
@@ -335,6 +424,25 @@ function CanvasInner({ model, connectorKind, grid, minimap, dark, overlay, peers
         const nodeIds = new Set(ids.filter((id) => byId.has(id)));
         for (const e of diagram.edges) if (set.has(e.id)) [e.source, e.target].forEach((n) => nodeIds.add(n));
         if (nodeIds.size) flow.fitView({ nodes: [...nodeIds].map((id) => ({ id })), padding: 0.6, maxZoom: 1.2, duration: 300 });
+      },
+      follow: (ids, { fit = false, bottom = 0 } = {}) => {
+        const bounds = union(ids.flatMap((id) => (byId.has(id) ? [footprint(byId.get(id)!, byId)] : [])));
+        const rect = wrapper.current?.getBoundingClientRect();
+        if (!bounds || !rect) return;
+        const height = Math.max(rect.height - bottom, 160);
+        const view = flow.getViewport();
+        if (!fit) {
+          const m = 48;
+          const inView =
+            bounds.x >= (m - view.x) / view.zoom &&
+            bounds.y >= (m - view.y) / view.zoom &&
+            bounds.x + bounds.width <= (rect.width - m - view.x) / view.zoom &&
+            bounds.y + bounds.height <= (height - m - view.y) / view.zoom;
+          if (inView) return;
+        }
+        // Following keeps the zoom unless the hop doesn't fit; framing zooms in, but not past 110%.
+        const viewport = getViewportForBounds(bounds, rect.width, height, MIN_ZOOM, fit ? 1.1 : view.zoom, 0.12);
+        void flow.setViewport(viewport, { duration: fit ? 500 : 400 });
       },
       select: (ids) => {
         const set = new Set(ids);
@@ -358,11 +466,15 @@ function CanvasInner({ model, connectorKind, grid, minimap, dark, overlay, peers
       dark,
       commitLabel: (id, label) => {
         setEditingId(null);
-        if (byId.has(id)) actions.patchNode(id, { label });
-        else actions.patchEdge(id, { label: label || undefined });
+        const node = byId.get(id);
+        if (!node) return actions.patchEdge(id, { label: label || undefined });
+        // A class or table grows to show every row.
+        const def = node.kind === "shape" ? shapeDef(node.shape) : null;
+        const needs = def?.rows && def.rows !== "table" ? rowsLayout(def.rows, label).height : 0;
+        actions.patchNode(id, needs > (node.h ?? 0) ? { label, h: Math.ceil(needs / GRID) * GRID } : { label });
       },
       onQuickAdd: (id, side) => {
-        const created = addConnected(id, side, model.current(), actions, connectorKind);
+        const created = addConnected(id, side, model.current(), actions, connector);
         if (created) {
           pendingSelect.current = new Set([created]);
           setNodes((nds) => nds.map((n) => (n.selected ? { ...n, selected: false } : n)));
@@ -370,14 +482,16 @@ function CanvasInner({ model, connectorKind, grid, minimap, dark, overlay, peers
         }
       },
     }),
-    [overlay, editingId, dark, byId, actions, model, connectorKind],
+    [overlay, editingId, dark, byId, actions, model, connector],
   );
+
+  const multi = nodes.filter((n) => n.selected).length > 1;
 
   return (
     <EditorContext.Provider value={context}>
       <div
         ref={wrapper}
-        className={`ss-canvas${connecting ? " connecting" : ""}${grid ? "" : " no-grid"}`}
+        className={`ss-canvas${connecting ? " connecting" : ""}${grid ? "" : " no-grid"}${multi ? " multi" : ""}${overlay.flow ? " flow-on" : ""}`}
         onPointerMove={onPointerMove}
         onPointerLeave={() => onPointer(null)}
       >
@@ -394,14 +508,18 @@ function CanvasInner({ model, connectorKind, grid, minimap, dark, overlay, peers
           onReconnect={onReconnect}
           edgesReconnectable
           onNodeDragStop={onNodeDragStop}
-          onNodeDoubleClick={(_, node) => setEditingId(node.id)}
+          onNodeClick={onNodeClick}
+          onNodeDoubleClick={(_, node) => {
+            const d = node.data.node;
+            if (d.kind !== "shape" || shapeDef(d.shape).label !== "none") setEditingId(node.id);
+          }}
           onEdgeDoubleClick={(_, edge) => setEditingId(edge.id)}
           onPaneClick={() => setInsert(null)}
-          onSelectionChange={({ nodes: ns, edges: es }) => onSelection({ nodes: ns.map((n) => n.id), edges: es.map((e) => e.id) })}
+          onSelectionChange={onSelectionChange}
           onMove={(_, viewport) => onZoom(viewport.zoom)}
           onDragOver={onDragOver}
           onDrop={onDrop}
-          isValidConnection={(c) => c.source !== c.target && byId.get(c.source)?.kind === "component" && byId.get(c.target)?.kind === "component"}
+          isValidConnection={(c) => c.source !== c.target && connectable(byId.get(c.source)) && connectable(byId.get(c.target))}
           connectionMode={ConnectionMode.Loose}
           connectionLineType={ConnectionLineType.SmoothStep}
           connectionLineStyle={{ stroke: SELECT, strokeWidth: 1.5 }}
@@ -418,8 +536,8 @@ function CanvasInner({ model, connectorKind, grid, minimap, dark, overlay, peers
           deleteKeyCode={["Delete", "Backspace"]}
           multiSelectionKeyCode={["Shift", "Control", "Meta"]}
           elevateNodesOnSelect={false}
-          minZoom={0.15}
-          maxZoom={3}
+          minZoom={MIN_ZOOM}
+          maxZoom={MAX_ZOOM}
           colorMode={dark ? "dark" : "light"}
           proOptions={{ hideAttribution: false }}
         >
@@ -431,18 +549,22 @@ function CanvasInner({ model, connectorKind, grid, minimap, dark, overlay, peers
           </ViewportPortal>
         </ReactFlow>
         {insert && (
-          <div className="ss-insert" style={{ left: insert.screen.x, top: insert.screen.y }}>
+          <div
+            className="ss-insert"
+            // Kept inside the canvas: near the bottom or right edge it opens up or to the left.
+            style={{
+              left: Math.max(0, Math.min(insert.screen.x, (wrapper.current?.clientWidth ?? 1e4) - 340)),
+              top: Math.max(0, Math.min(insert.screen.y, (wrapper.current?.clientHeight ?? 1e4) - 350)),
+            }}
+          >
             <div className="ss-insert-title">Add and connect</div>
             <div className="ss-insert-grid">
-              {LIBRARY.flatMap((g) => g.items)
-                .filter((i) => i.kind === "component")
-                .map((item) => (
-                  <button key={item.key} type="button" className="ss-insert-item" title={item.label} onClick={() => insertConnected(item)}>
-                    {/* eslint-disable-next-line @next/next/no-img-element */}
-                    <img src={itemIcon(item)!} alt="" width={28} height={28} />
-                    <span>{item.label}</span>
-                  </button>
-                ))}
+              {insertChoices(byId.get(insert.from)).map((item) => (
+                <button key={item.key} type="button" className="ss-insert-item" title={item.name} onClick={() => insertConnected(item)}>
+                  <ItemThumb item={item} />
+                  <span>{item.name}</span>
+                </button>
+              ))}
             </div>
           </div>
         )}

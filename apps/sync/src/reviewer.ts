@@ -15,8 +15,8 @@ import {
   type ReviewerStatus,
   chatArray,
   deriveFromDiagram,
-  deriveGraph,
   diagramEdgesMap,
+  diagramFromElements,
   diagramNodesMap,
   dismissedMap,
   elementsMap,
@@ -31,6 +31,7 @@ import {
   syncMap,
   voteTally,
   writeGraph,
+  zonesOf,
 } from "@stacksketch/graph";
 import type * as Y from "yjs";
 import { type Api, ApiError } from "./api";
@@ -38,6 +39,9 @@ import type { Store } from "./store";
 
 /** Transaction origin for everything the server writes. */
 export const SERVER_ORIGIN = { source: "local" as const, context: { stacksketch: "server" } };
+
+/** Set in the board's meta once its Excalidraw canvas has been converted to the diagram. */
+const CONVERTED_KEY = "diagram_converted_at";
 
 export interface ReviewerOptions {
   deriveDebounceMs: number;
@@ -108,9 +112,25 @@ export class StackSketchReviewer implements Extension {
       type.observe(handler);
       state.cleanup.push(() => type.unobserve(handler));
     };
-    // Two canvases during the move to the diagram editor: Excalidraw elements (current
-    // editor) and the diagram model (new editor). Watch both; see derive() for which wins.
-    observe(elementsMap(document), () => this.schedule(state, "derive", this.opts.deriveDebounceMs));
+    // Boards drawn with the earlier Excalidraw canvas are converted to the diagram once.
+    // The old elements stay in the document untouched, so going back to that editor still works.
+    const meta = metaMap(document);
+    if (elementsMap(document).size > 0 && !meta.get(CONVERTED_KEY)) {
+      if (diagramNodesMap(document).size > 0) {
+        // Already drawn on in the new editor: that work is newer than the old canvas, keep it.
+        document.transact(() => meta.set(CONVERTED_KEY, Date.now()), SERVER_ORIGIN);
+      } else {
+        const diagram = diagramFromElements(readElements(document));
+        document.transact(() => {
+          diagramEdgesMap(document).clear();
+          for (const n of diagram.nodes) diagramNodesMap(document).set(n.id, n);
+          for (const e of diagram.edges) diagramEdgesMap(document).set(e.id, e);
+          meta.set(CONVERTED_KEY, Date.now());
+        }, SERVER_ORIGIN);
+        console.log(`[${documentName}] converted the old canvas: ${diagram.nodes.length} shapes, ${diagram.edges.length} connectors`);
+      }
+    }
+
     observe(diagramNodesMap(document), () => this.schedule(state, "derive", this.opts.deriveDebounceMs));
     observe(diagramEdgesMap(document), () => this.schedule(state, "derive", this.opts.deriveDebounceMs));
     observe(dismissedMap(document), () => this.schedule(state, "review", 300));
@@ -154,10 +174,7 @@ export class StackSketchReviewer implements Extension {
 
   private derive(state: BoardState, force: boolean): void {
     const { doc } = state;
-    // A board with Excalidraw elements is still edited in the current editor; a board
-    // with only a diagram comes from the new one. (diagramFromElements converts the
-    // former once the new editor ships, and should clear the elements when it does.)
-    const { graph, issues } = elementsMap(doc).size > 0 ? deriveGraph(readElements(doc)) : deriveFromDiagram(readDiagram(doc));
+    const { graph, issues } = deriveFromDiagram(readDiagram(doc));
     doc.transact(() => {
       const changed = writeGraph(doc, graph, SERVER_ORIGIN);
       const meta = metaMap(doc);
@@ -328,11 +345,14 @@ export class StackSketchReviewer implements Extension {
         .slice(0, upTo + 1)
         .filter((m) => m.status !== "error")
         .map((m) => ({ role: m.role, author: m.author, text: m.text }));
-      const res = await this.api.chat(readGraph(state.doc), readFindings(state.doc), history);
+      const graph = readGraph(state.doc);
+      const res = await this.api.chat(graph, zonesOf(readDiagram(state.doc), graph), readFindings(state.doc), history);
       if (state.disposed) return;
+      // Edits go out as a proposal; the browser tab that asked lays them out and applies them.
+      const edits = res.edits ? { edits: res.edits, edit_state: "proposed" as const } : {};
       settle(
         { status: "answered" },
-        { id: `ai-${pending.id}`, role: "assistant", author: "StackSketch AI", text: res.reply, ts: Date.now(), reply_to: pending.id },
+        { id: `ai-${pending.id}`, role: "assistant", author: "StackSketch AI", text: res.reply, ts: Date.now(), reply_to: pending.id, ...edits },
       );
     } catch (err) {
       if (!state.disposed) settle({ status: "error", error: errorText(err) });

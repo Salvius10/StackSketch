@@ -36,7 +36,7 @@ export interface LayoutGroup {
 }
 
 export interface Layout {
-  /** Node id -> icon box (the name sits below it). */
+  /** Node id -> icon box (the name sits below it), or the node's own box when `sizes` gave one. */
   boxes: Map<string, Box>;
   /** Edge id -> route from the source icon to the target icon. */
   routes: Map<string, Point[]>;
@@ -50,6 +50,8 @@ export interface LayoutOptions {
   systemName?: string;
   /** Lay out these zones instead; nodes in none of them sit outside any zone. */
   groups?: LayoutGroup[];
+  /** Nodes that aren't icons (shapes, with their text inside): their size. */
+  sizes?: ReadonlyMap<string, { width: number; height: number }>;
 }
 
 /** Name font metrics, for reserving room under each icon. */
@@ -93,13 +95,17 @@ let elk: InstanceType<typeof ELK> | null = null;
 
 export async function layoutGraph(graph: Graph, options: LayoutOptions = {}): Promise<Layout> {
   elk ??= new ELK();
-  const leaf = (n: GraphNode): ElkNode => ({
-    id: n.id,
-    width: ICON_SIZE,
-    height: ICON_SIZE,
-    labels: [{ id: `${n.id}::label`, text: labelLines(n).join("\n"), ...labelSize(n) }],
-    layoutOptions: { "elk.nodeLabels.placement": "[H_CENTER, V_BOTTOM, OUTSIDE]" },
-  });
+  const sizeOf = (id: string) => options.sizes?.get(id) ?? { width: ICON_SIZE, height: ICON_SIZE };
+  const leaf = (n: GraphNode): ElkNode =>
+    options.sizes?.has(n.id)
+      ? { id: n.id, ...sizeOf(n.id) }
+      : {
+          id: n.id,
+          width: ICON_SIZE,
+          height: ICON_SIZE,
+          labels: [{ id: `${n.id}::label`, text: labelLines(n).join("\n"), ...labelSize(n) }],
+          layoutOptions: { "elk.nodeLabels.placement": "[H_CENTER, V_BOTTOM, OUTSIDE]" },
+        };
 
   const known = new Set(graph.nodes.map((n) => n.id));
   const nodeById = new Map(graph.nodes.map((n) => [n.id, n]));
@@ -156,7 +162,7 @@ export async function layoutGraph(graph: Graph, options: LayoutOptions = {}): Pr
   const boxes = new Map<string, Box>();
   const zones: Zone[] = [];
   const groupById = new Map(groups.map((g) => [`zone:${g.id}`, g]));
-  const place = (node: ElkNode) => boxes.set(node.id, { x: node.x ?? 0, y: node.y ?? 0, width: ICON_SIZE, height: ICON_SIZE });
+  const place = (node: ElkNode) => boxes.set(node.id, { x: node.x ?? 0, y: node.y ?? 0, ...sizeOf(node.id) });
   for (const child of result.children ?? []) {
     const group = groupById.get(child.id);
     if (!group) {

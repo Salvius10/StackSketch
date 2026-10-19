@@ -58,6 +58,25 @@ def test_gateway_routes_by_path():
     assert "unknown" not in summary
 
 
+def test_database_hop_uses_its_own_verb():
+    g = Graph(
+        nodes=[node("app", "client"), node("svc", "service", "Shortener"), node("db", "database", "URL DB"), node("q", "queue", "Clicks"),
+               node("worker", "worker", "Analytics Worker"), node("stats", "database", "Stats DB")],
+        edges=[
+            edge("app", "svc", endpoint="GET /abc"),
+            edge("svc", "db", endpoint="INSERT/SELECT"),
+            edge("svc", "q", kind="async", endpoint="click"),
+            edge("q", "worker", kind="async"),
+            edge("worker", "stats", endpoint="INSERT"),
+        ],
+    )
+    steps, _ = explain(g, "svc", "app->svc")
+    said = {s.edge_id: s.narration for s in steps if s.phase == "call"}
+    # A GET request still writes when the hop says INSERT.
+    assert said["svc->db"].startswith("Shortener reads from and writes to URL DB")
+    assert said["worker->stats"].startswith("Analytics Worker writes to Stats DB")
+
+
 def test_explain_rejects_unrelated_entry(shop):
     with pytest.raises(ValueError):
         explain(shop, "stripe", "web->api-gw")

@@ -8,3 +8,6 @@ export * from "./icons";
 export * from "./diagram";
 export * from "./doc";
 export * from "./snap";
+export * from "./shapes";
+export * from "./library";
+export * from "./templates";

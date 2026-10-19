@@ -1,8 +1,8 @@
-// The diagram the editor draws: components, zones, notes and connectors, kept in
-// the shared Yjs document. The typed graph the reviewer reads is derived from it:
-// components become nodes and connectors become edges, while zones and notes are
-// layout. Anything inside a zone is positioned relative to the zone, so it moves
-// with it.
+// The diagram the editor draws: components, shapes, zones, notes and connectors,
+// kept in the shared Yjs document. The typed graph the reviewer reads is derived
+// from it: components (and shapes someone gave a type) become nodes, and the
+// connectors between them become edges; everything else is drawing. Anything
+// inside a zone is positioned relative to the zone, so it moves with it.
 
 import {
   type Box,
@@ -15,8 +15,9 @@ import {
   parseEdgeLabel,
   slugify,
 } from "./derive";
-import { type Glyph, ICON_SIZE } from "./icons";
+import { type Glyph, ICON_SIZE, type IconFrame } from "./icons";
 import type { Layout, Point, ZoneKind } from "./layout";
+import type { NodeStyle } from "./shapes";
 import {
   type EdgeKind,
   type Graph,
@@ -29,7 +30,8 @@ import {
   isSource,
 } from "./schema";
 
-export type DiagramNodeKind = "component" | "zone" | "note";
+/** A component is an icon with its name underneath; a shape is any outline from the shape catalog. */
+export type DiagramNodeKind = "component" | "shape" | "zone" | "note";
 export type Side = "top" | "right" | "bottom" | "left";
 
 export interface DiagramNode {
@@ -38,24 +40,42 @@ export interface DiagramNode {
   /** Top-left corner; relative to the parent zone when there is one. */
   x: number;
   y: number;
-  /** Size of zones and notes. Components are always icon-sized. */
+  /** Size of shapes, zones and notes. Components are always icon-sized. */
   w?: number;
   h?: number;
   parent?: string | null;
-  /** Component name, zone title or note text. */
+  /** Component name, shape text, zone title or note text. */
   label: string;
-  type?: NodeType;
+  /**
+   * What the reviewer takes it for. A component without one is guessed from its name;
+   * null means "just drawing, not part of the system", as is a shape without one.
+   */
+  type?: NodeType | null;
   tech?: string | null;
   replicas?: number | null;
   dlq?: boolean | null;
   origin?: Source;
   confidence?: number;
-  /** A specific icon chosen from the shape library; otherwise it follows type and name. */
+  /** A specific icon chosen from the shape library; otherwise it follows type and name. Zones show it as a badge. */
   icon?: Glyph;
+  /** The icon's colour and frame, e.g. an AWS tile or a Kubernetes heptagon. */
+  tint?: string;
+  frame?: IconFrame;
+  /** Shapes: a key from the shape catalog. Zones: "swimlane" for a titled lane. */
+  shape?: string;
+  style?: NodeStyle;
+  /** Stacking order among siblings; higher is in front. */
+  z?: number;
   zone?: ZoneKind;
   /** On a note listing a numbered request flow: that flow's id. */
   legendFor?: string;
 }
+
+/** Arrowheads, as in draw.io: plain, open, UML (triangle, diamonds) and crow's foot. */
+export const ARROW_KINDS = ["none", "arrow", "open", "triangle", "diamond", "diamond-open", "circle", "er-one", "er-many", "er-zero-many", "er-one-many", "er-zero-one"] as const;
+export type ArrowKind = (typeof ARROW_KINDS)[number];
+export const LINE_STYLES = ["orthogonal", "straight", "curved"] as const;
+export type LineStyle = (typeof LINE_STYLES)[number];
 
 export interface DiagramEdge {
   id: string;
@@ -77,6 +97,25 @@ export interface DiagramEdge {
   points?: Point[] | null;
   /** Step numbers, when a request flow is numbered on the diagram. */
   steps?: number[] | null;
+  /** Arrowheads; by default an arrow at the end and none at the start. */
+  startArrow?: ArrowKind;
+  endArrow?: ArrowKind;
+  line?: LineStyle;
+  stroke?: string;
+  width?: number;
+}
+
+/**
+ * How far below a component's icon its bottom connection point sits: under the
+ * name (and technology), so a line going down doesn't run through them.
+ */
+export const nameDrop = (node: { kind: DiagramNodeKind; tech?: string | null }) => (node.kind === "component" ? (node.tech ? 40 : 24) : 0);
+
+/** Whether a node can be in the reviewed graph at all, and if so which type it was given. */
+function reviewedType(n: DiagramNode): NodeType | "guess" | null {
+  if (n.kind === "component") return n.type === null ? null : isNodeType(n.type) ? n.type : "guess";
+  if (n.kind === "shape") return isNodeType(n.type) ? n.type : null;
+  return null;
 }
 
 export interface Diagram {
@@ -117,10 +156,13 @@ export function deriveFromDiagram(diagram: { nodes: readonly DiagramNode[]; edge
     return id;
   };
 
-  for (const c of diagram.nodes.filter((n) => n.kind === "component").slice().sort(byId)) {
-    const label = (c.label ?? "").trim();
+  for (const c of diagram.nodes.slice().sort(byId)) {
+    const given = reviewedType(c);
+    if (given === null) continue;
+    // A shape's text may run to several lines (a C4 box's description); its name is the first.
+    const label = ((c.kind === "shape" ? c.label?.split("\n")[0] : c.label) ?? "").trim();
     const inferred = inferNodeType(`${label} ${c.tech ?? ""}`);
-    const type = isNodeType(c.type) ? c.type : inferred.type;
+    const type = given === "guess" ? inferred.type : given;
     const id = uniqueId(slugify(label) || `${type}-${c.id.slice(0, 4).toLowerCase()}`);
     idByCanvas.set(c.id, id);
     nodes.push({
@@ -132,18 +174,24 @@ export function deriveFromDiagram(diagram: { nodes: readonly DiagramNode[]; edge
       dlq: type === "queue" ? (c.dlq ?? null) : null,
       canvas_id: c.id,
       source: isSource(c.origin) ? c.origin : "user",
-      confidence: isNodeType(c.type) ? clamp01(c.confidence, 1) : inferred.confidence,
+      confidence: given === "guess" ? inferred.confidence : clamp01(c.confidence, 1),
     });
     if (!label) issues.push({ canvas_id: c.id, message: "Component has no name; name it so the reviewer can talk about it." });
   }
 
+  const present = new Map(diagram.nodes.map((n) => [n.id, n]));
   const edges: GraphEdge[] = [];
   const usedEdges = new Set<string>();
   for (const e of diagram.edges.slice().sort(byId)) {
     const from = idByCanvas.get(e.source);
     const to = idByCanvas.get(e.target);
     if (!from || !to) {
-      issues.push({ canvas_id: e.id, message: "Connector is not attached to a component at both ends, so it is not part of the graph." });
+      // Connectors between drawings are drawing too; one that leaves a component hanging is worth a word.
+      const dangling = [e.source, e.target].some((id) => {
+        const n = present.get(id);
+        return !n || n.kind === "zone" || n.kind === "note";
+      });
+      if ((from || to) && dangling) issues.push({ canvas_id: e.id, message: "Connector is not attached to a component at both ends, so it is not part of the graph." });
       continue;
     }
     if (from === to) continue;
@@ -178,6 +226,20 @@ export function deriveFromDiagram(diagram: { nodes: readonly DiagramNode[]; edge
   return { graph: { nodes, edges }, issues };
 }
 
+/** Each zone's title and the graph nodes inside it at any depth: what the room AI knows of the zones. */
+export function zonesOf(diagram: Diagram, graph: Graph): { label: string; members: string[] }[] {
+  const parentOf = new Map(diagram.nodes.map((n) => [n.id, n.parent ?? null]));
+  const members = new Map<string, string[]>();
+  for (const g of graph.nodes) {
+    const seen = new Set<string>();
+    for (let p = g.canvas_id ? parentOf.get(g.canvas_id) : null; p && !seen.has(p); p = parentOf.get(p)) {
+      seen.add(p);
+      members.set(p, [...(members.get(p) ?? []), g.id]);
+    }
+  }
+  return diagram.nodes.filter((n) => n.kind === "zone").map((z) => ({ label: z.label.trim() || "Group", members: members.get(z.id) ?? [] }));
+}
+
 /** Which sides a connector leaves and enters by, from where the two boxes sit. */
 export function sidesBetween(a: Box, b: Box): [Side, Side] {
   const dx = b.x + b.width / 2 - (a.x + a.width / 2);
@@ -196,8 +258,16 @@ function sidesOfRoute(route: Point[]): [Side, Side] | null {
   return [leave(route[0], route[1]), opposite[leave(route[n - 2], route[n - 1])]];
 }
 
-/** A laid-out graph as a diagram: zones with their members inside, routed connectors. */
-export function diagramFromLayout(graph: Graph, layout: Layout, newId: () => string = newDiagramId): Diagram {
+/**
+ * A laid-out graph as a diagram: zones with their members inside, routed connectors.
+ * `extra` adds to each component, e.g. a cloud provider's icon.
+ */
+export function diagramFromLayout(
+  graph: Graph,
+  layout: Layout,
+  newId: () => string = newDiagramId,
+  extra: (n: GraphNode) => Partial<DiagramNode> | undefined = () => undefined,
+): Diagram {
   const zones: DiagramNode[] = layout.zones.map((z) => ({
     id: newId(),
     kind: "zone",
@@ -233,6 +303,7 @@ export function diagramFromLayout(graph: Graph, layout: Layout, newId: () => str
       dlq: n.dlq,
       origin: n.source,
       confidence: n.confidence,
+      ...extra(n),
     });
   }
 

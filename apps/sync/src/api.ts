@@ -1,6 +1,6 @@
 // Thin client for the FastAPI service.
 
-import type { Finding, Graph, Question } from "@stacksketch/graph";
+import type { BoardEdits, Finding, Graph, Question } from "@stacksketch/graph";
 
 export interface ReviewResult {
   findings: Finding[];
@@ -83,11 +83,13 @@ export class Api {
     return this.post("/review/refine", { graph, diff, findings, not_useful: notUseful });
   }
 
+  /** The AI's reply, and the changes to the board it made when the message asked for some. */
   chat(
     graph: Graph,
+    zones: { label: string; members: string[] }[],
     findings: Finding[],
     messages: { role: "user" | "assistant"; author: string; text: string }[],
-  ): Promise<{ reply: string }> {
-    return this.post("/chat", { graph, findings, messages });
+  ): Promise<{ reply: string; edits: BoardEdits | null }> {
+    return this.post("/chat", { graph, zones, findings, messages });
   }
 }

@@ -1,5 +1,7 @@
 import type { Metadata, Viewport } from "next";
+import "@xyflow/react/dist/style.css";
 import "./globals.css";
+import "./editor.css";
 
 export const metadata: Metadata = {
   title: "StackSketch",

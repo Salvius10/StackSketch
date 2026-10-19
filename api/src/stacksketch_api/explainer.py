@@ -7,6 +7,7 @@ request, and what happens downstream is walked after the response goes back.
 
 from __future__ import annotations
 
+import re
 from collections import defaultdict, deque
 
 from .models import Edge, EntryPoint, FlowStep, Graph, Node
@@ -14,6 +15,9 @@ from .models import Edge, EntryPoint, FlowStep, Graph, Node
 LEAVES = {"database", "cache", "external"}
 MAX_STEPS = 60
 WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+# What a database hop says it does, e.g. "INSERT/SELECT" on the connector.
+DB_WRITES = re.compile(r"\b(insert|update|delete|upsert|merge|write|put)\b", re.IGNORECASE)
+DB_READS = re.compile(r"\b(select|read|get|query|find)\b", re.IGNORECASE)
 
 
 def _path(endpoint: str | None) -> tuple[str | None, str | None]:
@@ -136,13 +140,21 @@ class _Walker:
             bits.append("retrying on failure")
         return f", {' and '.join(bits)}" if bits else ""
 
+    def _db_verb(self, e: Edge) -> str:
+        """The hop's own verb when its label names one, else what the request's method implies."""
+        said = e.endpoint or ""
+        writes, reads = bool(DB_WRITES.search(said)), bool(DB_READS.search(said))
+        if writes or reads:
+            return "reads from and writes to" if writes and reads else "writes to" if writes else "reads from"
+        return "writes to" if self.writes else "reads from" if self.writes is False else "queries"
+
     def narrate_sync(self, e: Edge) -> str:
         a, b = self.name(e.from_), self.name(e.to)
         target = self.nodes[e.to]
         what = f" {e.endpoint}" if e.endpoint else ""
         over = f" over {e.protocol}" if e.protocol and e.protocol not in (e.endpoint or "") else ""
         if target.type == "database":
-            verb = "writes to" if self.writes else "reads from" if self.writes is False else "queries"
+            verb = self._db_verb(e)
             tech = f" ({target.tech})" if target.tech else ""
             return f"{a} {verb} {b}{tech}{':' + what if what else ''}{self._details(e)}."
         if target.type == "cache":

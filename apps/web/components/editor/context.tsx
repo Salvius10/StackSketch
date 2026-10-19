@@ -3,16 +3,9 @@
 // What the canvas's nodes and edges need beyond their own data: reviewer pins,
 // teammates' selections, the flow animation and inline editing.
 
-import type { EdgeKind, Severity, Side } from "@stacksketch/graph";
+import type { Severity, Side } from "@stacksketch/graph";
 import { createContext, useContext } from "react";
-
-export interface Hop {
-  canvasId: string;
-  phase: "call" | "return";
-  kind: EdgeKind;
-  /** Changes every step, so the animation restarts. */
-  key: string;
-}
+import type { FlowView } from "@/lib/flow-view";
 
 export interface EditorContextValue {
   /** Canvas id -> worst open finding on it. */
@@ -23,7 +16,8 @@ export interface EditorContextValue {
   unsure: Map<string, string>;
   /** Canvas id -> colour of a teammate who has it selected. */
   remoteSelection: Map<string, string>;
-  hop: Hop | null;
+  /** The request flow playing now, if any. */
+  flow: FlowView | null;
   editingId: string | null;
   setEditingId(id: string | null): void;
   commitLabel(id: string, label: string): void;

@@ -22,7 +22,23 @@ import anthropic
 import httpx
 from pydantic import BaseModel, Field, ValidationError
 
-from .models import SEVERITY_RANK, ChatTurn, Edge, Finding, FlowStep, Graph, GraphDiff, Node
+from .models import (
+    SEVERITY_RANK,
+    BoardEdits,
+    ChatTurn,
+    Edge,
+    EdgeChange,
+    Finding,
+    FlowStep,
+    Graph,
+    GraphDiff,
+    NewEdge,
+    NewGroup,
+    NewNode,
+    Node,
+    NodeChange,
+    ZoneInfo,
+)
 
 log = logging.getLogger("stacksketch.llm")
 
@@ -158,6 +174,11 @@ class GenGraph(BaseModel):
     assumptions: list[str] = Field(description="Short notes on what you assumed, at most 5")
 
 
+class ChatOutput(BaseModel):
+    reply: str
+    edits: BoardEdits
+
+
 # --- prompts ------------------------------------------------------------------------
 
 REVIEW_SYSTEM = """You are the design reviewer inside StackSketch, an architecture whiteboard used by small engineering teams and solo developers. You read a typed graph of components (nodes) and connections (edges) and help the team catch real design flaws while they draw.
@@ -187,7 +208,24 @@ Rules:
 
 SKETCH_PROMPT = "This is a hand-drawn architecture sketch. Read it into the typed graph exactly as drawn: one node per box or shape, one edge per arrow in the direction of the arrowhead. Solid arrows are sync, dashed arrows are async, double or dotted arrows are stream. Use the text on arrows as the endpoint. Do not add components that are not drawn."
 
-CHAT_SYSTEM = """You are the shared AI in a StackSketch room: an architecture whiteboard where a small team designs a system together. Everyone in the room sees your replies. You get the current typed graph, the reviewer's open findings and the room's chat thread. Answer the latest message using the actual components in the graph. Be concise and concrete: a few sentences or a short list. If the graph does not contain what is needed to answer, say what is missing."""
+CHAT_SYSTEM = """You are the shared AI in a StackSketch room: an architecture whiteboard where a small team designs a system together. Everyone in the room sees your replies. You get the current typed graph, its zones (named boxes grouping components), the reviewer's open findings and the room's chat thread.
+
+Answer the latest message in `reply`, using the actual components in the graph; call them by their names, not their ids. Be concise and concrete: a few sentences or a short list. If the graph does not contain what is needed to answer, say what is missing.
+
+You can also change the board. Only when the latest message asks you to draw, add, remove, connect, rename, group, fix or improve something, put the changes in `edits` and say in `reply` what you changed and why, in a sentence or two. When it only asks a question, leave every list in `edits` empty.
+
+How to write edits:
+- Refer to existing components by node id and to existing connections by edge id ("from->to").
+- A new component needs a new kebab-case id that is not in the graph; use that id in add_edges and groups. Connect every new component with at least one entry in add_edges: a dead-letter queue, for example, is a new queue with an async connection from the queue it serves.
+- Every connection goes from the caller or producer to the callee or consumer; queue consumers are edges from the queue to the worker. sync: the caller waits for the reply; async: a message or event; stream: a continuous stream.
+- In update_nodes and update_edges, null means "leave it as it is": set only the fields that change, and leave out components and connections you are not changing.
+- One connection per call: the reply travels back on the same connection, so never add one for a response. Connections into and out of a queue are async.
+- Leave protocol, endpoint, retry, timeout_ms and hot_path null unless the team or the graph gives them.
+- zone on a new component: the name of an existing zone to put it in, or null to put it beside what it connects to.
+- groups: put components (existing or new) in a new zone with that name.
+- To improve a design, fix the open findings an edit can fix (a dead-letter queue, a second replica, a timeout, a cache) and keep to the few changes that matter most.
+- Remove only what the team asks you to remove. Never invent numbers a fix does not need.
+- On an empty board, draw what was asked: usually 5 to 12 components, grouped into zones such as clients, the system and external services."""
 
 
 def _graph_json(graph: Graph) -> str:
@@ -228,17 +266,28 @@ class LLM:
         key = "OPENROUTER_API_KEY" if self.provider == "openrouter" else "ANTHROPIC_API_KEY or OPENROUTER_API_KEY"
         return LLMUnavailable(f"No AI credentials configured: set {key} in .env and restart the API.")
 
-    async def _parse(self, system: str, user: str, output: type[T], max_tokens: int = 16000, image: tuple[str, str] | None = None) -> T:
-        """One structured call. `image` is (base64 data, media type) for vision input."""
+    async def _parse(
+        self,
+        system: str,
+        user: str,
+        output: type[T],
+        max_tokens: int = 16000,
+        image: tuple[str, str] | None = None,
+        history: list[dict[str, Any]] | None = None,
+    ) -> T:
+        """One structured call. `image` is (base64 data, media type) for vision input; `history` is
+        earlier turns of a conversation, alternating user and assistant, before `user`."""
         if not self.enabled:
             raise self._unavailable()
         if self.provider == "openrouter":
-            return await self._openrouter_parse(system, user, output, max_tokens, image)
-        return await self._anthropic_parse(system, user, output, max_tokens, image)
+            return await self._openrouter_parse(system, user, output, max_tokens, image, history or [])
+        return await self._anthropic_parse(system, user, output, max_tokens, image, history or [])
 
     # --- Anthropic ---------------------------------------------------------------------------
 
-    async def _anthropic_parse(self, system: str, user: str, output: type[T], max_tokens: int, image: tuple[str, str] | None) -> T:
+    async def _anthropic_parse(
+        self, system: str, user: str, output: type[T], max_tokens: int, image: tuple[str, str] | None, history: list[dict[str, Any]]
+    ) -> T:
         content: Any = user
         if image:
             content = [{"type": "image", "source": {"type": "base64", "media_type": image[1], "data": image[0]}}, {"type": "text", "text": user}]
@@ -247,7 +296,7 @@ class LLM:
                 model=self.model,
                 max_tokens=max_tokens,
                 system=system,
-                messages=[{"role": "user", "content": content}],
+                messages=[*history, {"role": "user", "content": content}],
                 output_format=output,
                 output_config={"effort": self.effort},
                 betas=["server-side-fallback-2026-07-01"],
@@ -314,7 +363,9 @@ class LLM:
             raise LLMUnavailable(f"{self.model}'s answer was cut off.")
         return reply
 
-    async def _openrouter_parse(self, system: str, user: str, output: type[T], max_tokens: int, image: tuple[str, str] | None) -> T:
+    async def _openrouter_parse(
+        self, system: str, user: str, output: type[T], max_tokens: int, image: tuple[str, str] | None, history: list[dict[str, Any]]
+    ) -> T:
         content: Any = user
         if image:
             content = [{"type": "image_url", "image_url": {"url": f"data:{image[1]};base64,{image[0]}"}}, {"type": "text", "text": user}]
@@ -323,7 +374,7 @@ class LLM:
                 "model": self.model,
                 # Our outputs are small, and many cheaper models cap output well below 16k tokens.
                 "max_tokens": min(max_tokens, 8000),
-                "messages": [{"role": "system", "content": system}, {"role": "user", "content": content}],
+                "messages": [{"role": "system", "content": system}, *history, {"role": "user", "content": content}],
                 "response_format": {
                     "type": "json_schema",
                     "json_schema": {"name": output.__name__, "strict": True, "schema": strict_json_schema(output)},
@@ -408,11 +459,14 @@ class LLM:
 
     # --- room chat -------------------------------------------------------------------------
 
-    async def chat(self, graph: Graph, findings: list[Finding], messages: list[ChatTurn]) -> str:
+    async def chat(self, graph: Graph, findings: list[Finding], messages: list[ChatTurn], zones: list[ZoneInfo] | None = None) -> tuple[str, BoardEdits]:
+        """The reply to the latest message, and the changes to the board it asked for (checked against the graph)."""
         if not self.enabled:
             raise self._unavailable()
         context = (
-            f"<graph>\n{_graph_json(graph)}\n</graph>\n<open_findings>\n"
+            f"<graph>\n{_graph_json(graph)}\n</graph>\n<zones>\n"
+            + json.dumps([z.model_dump() for z in zones or []], indent=1)
+            + "\n</zones>\n<open_findings>\n"
             + json.dumps([f.model_dump(include={"severity", "target", "title", "message"}) for f in findings], indent=1)
             + "\n</open_findings>"
         )
@@ -425,28 +479,126 @@ class LLM:
                 thread.append({"role": m.role, "content": content})
         if thread[-1]["role"] != "user":
             raise ValueError("The last chat message must be from a user.")
-        if self.provider == "openrouter":
-            reply = await self._openrouter(
-                {"model": self.model, "max_tokens": 4000, "messages": [{"role": "system", "content": CHAT_SYSTEM}, *thread]}
+        out = await self._parse(CHAT_SYSTEM, thread[-1]["content"], ChatOutput, max_tokens=8000, history=thread[:-1])
+        asked = " ".join([messages[-1].text, *(f"{f.title} {f.message} {f.fix}" for f in findings)])
+        edits = clean_edits(graph, out.edits, asked)
+        reply = out.reply.strip()
+        if edits.is_empty() and not out.edits.is_empty():
+            # The reply describes changes, but none of them would change anything.
+            reply += "\n\n(Nothing on the board changed: those changes are already there, or name components that are not on it.)"
+        return reply, edits
+
+
+def _slug(text: str) -> str:
+    return "-".join("".join(c if c.isalnum() else " " for c in text.lower()).split())
+
+
+# Fields the AI may set on a connection only when the team's message or an open finding
+# brings them up: otherwise they would be guesses that hide the reviewer's questions.
+_ASKED_FOR = {"retry": ("retr",), "timeout_ms": ("timeout", "time out", "timing out"), "hot_path": ("hot path", "hot-path", "critical path")}
+
+
+def clean_edits(graph: Graph, edits: BoardEdits, asked: str | None = None) -> BoardEdits:
+    """Keep the edits that fit the graph: known ids only, new ids made unique, no self
+    loops or duplicate connections, no edits to what is being removed, and only the
+    fields that actually change. Connections to a queue are messages (async), and a
+    sync call's reply is never a connection of its own. With `asked` (what the team
+    asked, and the open findings), retry, timeout and hot-path values it doesn't
+    mention are dropped."""
+    unasked = {f for f, words in _ASKED_FOR.items() if not any(w in asked.lower() for w in words)} if asked is not None else set()
+    nodes = {n.id: n for n in graph.nodes}
+    edges = {e.id: e for e in graph.edges}
+    remove_nodes = [i for i in dict.fromkeys(edits.remove_nodes) if i in nodes]
+    removed = set(remove_nodes)
+    taken = set(nodes)
+    remap: dict[str, str] = {}
+    add_nodes: list[NewNode] = []
+    for n in edits.add_nodes:
+        label = n.label.strip()[:80]
+        if not label:
+            continue
+        base = _slug(n.id) or _slug(label) or n.type
+        nid, i = base, 2
+        while nid in taken:
+            nid, i = f"{base}-{i}", i + 1
+        taken.add(nid)
+        remap.setdefault(n.id, nid)
+        remap.setdefault(_slug(n.id), nid)
+        add_nodes.append(n.model_copy(update={"id": nid, "label": label, "tech": (n.tech or "").strip() or None, "zone": (n.zone or "").strip() or None}))
+
+    def ref(raw: str) -> str | None:
+        """A new node by the id the model gave it, else an existing node that stays."""
+        if raw in remap:
+            return remap[raw]
+        return raw if raw in nodes and raw not in removed else None
+
+    def kept_edge(eid: str) -> bool:
+        e = edges.get(eid)
+        return e is not None and e.from_ not in removed and e.to not in removed
+
+    # Models often repeat a component's current values; keep only what is new.
+    type_of = {n.id: n.type for n in graph.nodes} | {n.id: n.type for n in add_nodes}
+    update_nodes: list[NodeChange] = []
+    for u in edits.update_nodes:
+        cur = nodes.get(u.id)
+        if cur is None or u.id in removed:
+            continue
+        label = (u.label or "").strip()[:80] or None
+        tech = (u.tech or "").strip() or None
+        type_of[u.id] = u.type or cur.type
+        change = NodeChange(
+            id=u.id,
+            label=label if label != cur.label else None,
+            type=u.type if u.type != cur.type else None,
+            tech=tech if tech != cur.tech else None,
+            replicas=u.replicas if u.replicas is not None and u.replicas >= 0 and u.replicas != cur.replicas else None,
+            # Only a queue has a dead-letter queue.
+            dlq=u.dlq if type_of[u.id] == "queue" and u.dlq != cur.dlq else None,
+        )
+        if any(v is not None for k, v in change if k != "id"):
+            update_nodes.append(change)
+    remove_edges = [e for e in dict.fromkeys(edits.remove_edges) if kept_edge(e)]
+    update_edges: list[EdgeChange] = []
+    for u in edits.update_edges:
+        if not kept_edge(u.id) or u.id in remove_edges:
+            continue
+        cur_edge = edges[u.id]
+        fields = {k: v for k, v in u if k != "id" and k not in unasked and v is not None and v != getattr(cur_edge, k)}
+        if (fields.get("timeout_ms") or 0) < 0:
+            del fields["timeout_ms"]
+        if fields:
+            update_edges.append(EdgeChange(id=u.id, **{k: fields.get(k) for k in EdgeChange.model_fields if k != "id"}))
+    # An existing connection the model "adds" again would only duplicate it.
+    linked = {(e.from_, e.to): e.kind for e in graph.edges if kept_edge(e.id) and e.id not in remove_edges}
+    add_edges: list[NewEdge] = []
+    for e in edits.add_edges:
+        src, dst = ref(e.from_node), ref(e.to_node)
+        if not src or not dst or src == dst or (src, dst) in linked:
+            continue
+        kind = "async" if e.kind == "sync" and "queue" in (type_of.get(src), type_of.get(dst)) else e.kind
+        if kind == "sync" and linked.get((dst, src)) == "sync":
+            continue
+        linked[(src, dst)] = kind
+        add_edges.append(
+            e.model_copy(
+                update={"from_node": src, "to_node": dst, "kind": kind, "timeout_ms": e.timeout_ms if (e.timeout_ms or 0) >= 0 else None}
+                | dict.fromkeys(unasked)
             )
-            return _text(reply.get("content"))
-        try:
-            resp = await self.client.beta.messages.create(
-                model=self.model,
-                max_tokens=4000,
-                system=CHAT_SYSTEM,
-                messages=thread,  # type: ignore[arg-type]
-                output_config={"effort": "low"},
-                betas=["server-side-fallback-2026-07-01"],
-                fallbacks="default",
-            )
-        except anthropic.APIStatusError as e:
-            raise LLMUnavailable(f"Claude API error {e.status_code}: {e.message}") from e
-        except anthropic.APIConnectionError as e:
-            raise LLMUnavailable("Could not reach the Claude API.") from e
-        if resp.stop_reason == "refusal":
-            raise LLMUnavailable("Claude declined this request.")
-        return "".join(b.text for b in resp.content if b.type == "text").strip()
+        )
+    groups: list[NewGroup] = []
+    for g in edits.groups:
+        members = list(dict.fromkeys(m for m in (ref(raw) for raw in g.members) if m))
+        if members:
+            groups.append(NewGroup(label=g.label.strip()[:60] or "Group", members=members))
+    return BoardEdits(
+        add_nodes=add_nodes,
+        update_nodes=update_nodes,
+        remove_nodes=remove_nodes,
+        add_edges=add_edges,
+        update_edges=update_edges,
+        remove_edges=remove_edges,
+        groups=groups,
+    )
 
 
 def gen_to_graph(out: GenGraph) -> tuple[Graph, list[str]]:

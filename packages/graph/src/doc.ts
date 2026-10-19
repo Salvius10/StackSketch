@@ -62,6 +62,16 @@ export const metaMap = (doc: Y.Doc) => doc.getMap<unknown>(KEYS.meta);
 
 const byId = <T extends { id: string }>(a: T, b: T) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
 
+/** Change fields of one chat message (entries of a Y.Array are replaced whole). Call inside a transaction. */
+export function patchChatMessage(doc: Y.Doc, id: string, patch: Partial<ChatMessage>): void {
+  const arr = chatArray(doc);
+  const i = arr.toArray().findIndex((m) => m.id === id);
+  if (i < 0) return;
+  const current = arr.get(i);
+  arr.delete(i, 1);
+  arr.insert(i, [{ ...current, ...patch }]);
+}
+
 export function readElements(doc: Y.Doc): CanvasElement[] {
   return Array.from(elementsMap(doc).values());
 }

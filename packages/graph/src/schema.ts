@@ -1,6 +1,8 @@
 // The one typed graph every StackSketch feature reads or writes.
 // Unknown fields stay null: the reviewer asks rather than guesses.
 
+import type { DiagramEdge, DiagramNode } from "./diagram";
+
 export const NODE_TYPES = [
   "client",
   "gateway",
@@ -114,6 +116,44 @@ export interface Flow {
   created_by: string;
 }
 
+// --- board edits: changes the room AI makes, in graph ids (mirrors api/models.py) ------
+
+export interface BoardEdits {
+  /** zone: the name of an existing zone to put it in; null puts it beside what it connects to. */
+  add_nodes: { id: string; type: NodeType; label: string; tech: string | null; zone: string | null }[];
+  /** null fields stay as they are. */
+  update_nodes: { id: string; label: string | null; type: NodeType | null; tech: string | null; replicas: number | null; dlq: boolean | null }[];
+  remove_nodes: string[];
+  add_edges: {
+    from_node: string;
+    to_node: string;
+    kind: EdgeKind;
+    protocol: string | null;
+    endpoint: string | null;
+    retry: boolean | null;
+    timeout_ms: number | null;
+    hot_path: boolean | null;
+  }[];
+  update_edges: {
+    id: string;
+    kind: EdgeKind | null;
+    protocol: string | null;
+    endpoint: string | null;
+    retry: boolean | null;
+    timeout_ms: number | null;
+    hot_path: boolean | null;
+  }[];
+  remove_edges: string[];
+  /** New zones around these node ids. */
+  groups: { label: string; members: string[] }[];
+}
+
+/** Diagram changes as data: put these nodes and edges, delete those ids. */
+export interface BoardChange {
+  put: { nodes: DiagramNode[]; edges: DiagramEdge[] };
+  remove: { nodes: string[]; edges: string[] };
+}
+
 export interface ChatMessage {
   id: string;
   role: "user" | "assistant";
@@ -122,9 +162,20 @@ export interface ChatMessage {
   ts: number;
   /** Set on user messages addressed to the AI; the sync server answers "pending" ones. */
   status?: "pending" | "answered" | "error";
+  /** On user messages: the browser tab that sent it. That tab applies the AI's edits. */
+  tab?: string;
   /** On AI replies: the id of the message being answered. */
   reply_to?: string;
   error?: string;
+  /** On AI replies: changes to the board, and whether they are on it. */
+  edits?: BoardEdits;
+  edit_state?: "proposed" | "applied" | "undone" | "failed";
+  /** What the edits did, in a few words, or why they could not be applied. */
+  edit_note?: string;
+  /** Puts the board back as it was before the edits. */
+  edit_undo?: BoardChange;
+  /** The nodes the edits added, to show them. */
+  edit_ids?: string[];
 }
 
 export interface ReviewerStatus {

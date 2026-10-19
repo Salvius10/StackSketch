@@ -12,7 +12,7 @@ import {
   diagramNodesMap,
   readDiagram,
 } from "@stacksketch/graph";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as Y from "yjs";
 
 export const LOCAL_ORIGIN = { source: "stacksketch-editor" };
@@ -33,7 +33,7 @@ export interface DiagramActions {
 
 /** Undefined in a patch removes the field (back to "unknown"). */
 function merge<T extends object>(current: T, patch: Partial<T>): T {
-  const next: Record<string, unknown> = { ...current };
+  const next = { ...current } as Record<string, unknown>;
   for (const [k, v] of Object.entries(patch)) {
     if (v === undefined) delete next[k];
     else next[k] = v;
@@ -41,16 +41,20 @@ function merge<T extends object>(current: T, patch: Partial<T>): T {
   return next as T;
 }
 
+/** Apply a patch to one entry, skipping no-op writes (they would still be undo steps). */
+function patchIn<T extends object>(map: Y.Map<T>, id: string, patch: Partial<T>): void {
+  const current = map.get(id);
+  if (!current) return;
+  const next = merge(current, patch);
+  if (JSON.stringify(next) !== JSON.stringify(current)) map.set(id, next);
+}
+
 export function useDiagram(doc: Y.Doc) {
   const nodes = useMemo(() => diagramNodesMap(doc), [doc]);
   const edges = useMemo(() => diagramEdgesMap(doc), [doc]);
   const [diagram, setDiagram] = useState<Diagram>(() => readDiagram(doc));
   const [history, setHistory] = useState({ canUndo: false, canRedo: false });
-
-  const undoManager = useMemo(
-    () => new Y.UndoManager([nodes, edges], { trackedOrigins: new Set([LOCAL_ORIGIN]), captureTimeout: 400 }),
-    [nodes, edges],
-  );
+  const undoManager = useRef<Y.UndoManager | null>(null);
 
   useEffect(() => {
     let frame: number | null = null;
@@ -64,21 +68,22 @@ export function useDiagram(doc: Y.Doc) {
     nodes.observe(refresh);
     edges.observe(refresh);
     refresh();
-    const onStack = () => setHistory({ canUndo: undoManager.canUndo(), canRedo: undoManager.canRedo() });
-    undoManager.on("stack-item-added", onStack);
-    undoManager.on("stack-item-popped", onStack);
-    undoManager.on("stack-cleared", onStack);
+    // Created here rather than in render, so React's mount / unmount / remount in development
+    // ends up with a live one.
+    const manager = new Y.UndoManager([nodes, edges], { trackedOrigins: new Set([LOCAL_ORIGIN]), captureTimeout: 400 });
+    undoManager.current = manager;
+    const onStack = () => setHistory({ canUndo: manager.canUndo(), canRedo: manager.canRedo() });
+    manager.on("stack-item-added", onStack);
+    manager.on("stack-item-popped", onStack);
+    manager.on("stack-cleared", onStack);
     return () => {
       nodes.unobserve(refresh);
       edges.unobserve(refresh);
-      undoManager.off("stack-item-added", onStack);
-      undoManager.off("stack-item-popped", onStack);
-      undoManager.off("stack-cleared", onStack);
+      manager.destroy();
+      if (undoManager.current === manager) undoManager.current = null;
       if (frame !== null) cancelAnimationFrame(frame);
     };
-  }, [doc, nodes, edges, undoManager]);
-
-  useEffect(() => () => undoManager.destroy(), [undoManager]);
+  }, [doc, nodes, edges]);
 
   const transact = useCallback((fn: () => void) => doc.transact(fn, LOCAL_ORIGIN), [doc]);
 
@@ -91,32 +96,16 @@ export function useDiagram(doc: Y.Doc) {
         });
       },
       patchNode(id, patch) {
-        transact(() => {
-          const current = nodes.get(id);
-          if (current) nodes.set(id, merge(current, patch));
-        });
+        transact(() => patchIn(nodes, id, patch));
       },
       patchNodes(patches) {
-        transact(() => {
-          for (const { id, patch } of patches) {
-            const current = nodes.get(id);
-            if (current) nodes.set(id, merge(current, patch));
-          }
-        });
+        transact(() => patches.forEach(({ id, patch }) => patchIn(nodes, id, patch)));
       },
       patchEdge(id, patch) {
-        transact(() => {
-          const current = edges.get(id);
-          if (current) edges.set(id, merge(current, patch));
-        });
+        transact(() => patchIn(edges, id, patch));
       },
       patchEdges(patches) {
-        transact(() => {
-          for (const { id, patch } of patches) {
-            const current = edges.get(id);
-            if (current) edges.set(id, merge(current, patch));
-          }
-        });
+        transact(() => patches.forEach(({ id, patch }) => patchIn(edges, id, patch)));
       },
       remove({ nodes: nodeIds = [], edges: edgeIds = [] }) {
         transact(() => {
@@ -132,13 +121,13 @@ export function useDiagram(doc: Y.Doc) {
         transact(fn);
       },
       undo() {
-        undoManager.undo();
+        undoManager.current?.undo();
       },
       redo() {
-        undoManager.redo();
+        undoManager.current?.redo();
       },
     }),
-    [transact, nodes, edges, undoManager],
+    [transact, nodes, edges],
   );
 
   const byId = useMemo(() => new Map(diagram.nodes.map((n) => [n.id, n])), [diagram]);

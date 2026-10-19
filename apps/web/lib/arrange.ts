@@ -5,10 +5,10 @@
 
 import {
   type Box,
+  type ConnectorStyle,
   type Diagram,
   type DiagramEdge,
   type DiagramNode,
-  type DrawioZone,
   type Flow,
   type Graph,
   ICON_SIZE,
@@ -20,6 +20,7 @@ import {
   diagramFromLayout,
   layoutGraph,
   newDiagramId,
+  shapeDef,
   sidesBetween,
 } from "@stacksketch/graph";
 import type { DiagramActions } from "./diagram";
@@ -34,11 +35,19 @@ type NodeMap = ReadonlyMap<string, DiagramNode>;
 
 const byIdOf = (diagram: Diagram): NodeMap => new Map(diagram.nodes.map((n) => [n.id, n]));
 
-/** A node's box including the name under a component's icon. */
+/** Room a shape with its text underneath (an actor, a star) needs for it. */
+const BELOW_SPACE = 24;
+
+/** A node's box including the name under a component's icon or a shape's text below it. */
 export function footprint(node: DiagramNode, byId: NodeMap): Box {
   const box = absoluteBox(node, byId);
-  return node.kind === "component" ? { x: box.x - 24, y: box.y, width: box.width + 48, height: box.height + NAME_SPACE } : box;
+  if (node.kind === "component") return { x: box.x - 24, y: box.y, width: box.width + 48, height: box.height + NAME_SPACE };
+  if (node.kind === "shape" && node.label && shapeDef(node.shape).label === "below") return { ...box, height: box.height + BELOW_SPACE };
+  return box;
 }
+
+/** Things connectors can join: components and shapes, not zones or notes. */
+export const connectable = (n: DiagramNode | undefined): n is DiagramNode => n?.kind === "component" || n?.kind === "shape";
 
 export function union(boxes: Box[]): Box | null {
   if (boxes.length === 0) return null;
@@ -113,15 +122,20 @@ function outermost(ids: string[], diagram: Diagram): DiagramNode[] {
 
 // --- placing new things -----------------------------------------------------------
 
-/** The first spot near `at` where a component doesn't overlap anything (zones don't count). */
-export function freeSpot(at: { x: number; y: number }, diagram: Diagram): { x: number; y: number } {
+/**
+ * The first spot near `at` (the middle of what's added) where something of `size`
+ * doesn't overlap anything; zones don't count. Without a size, it's a component.
+ */
+export function freeSpot(at: { x: number; y: number }, diagram: Diagram, size?: { w: number; h: number }): { x: number; y: number } {
   const byId = byIdOf(diagram);
   const taken = diagram.nodes.filter((n) => n.kind !== "zone").map((n) => footprint(n, byId));
-  const start = { x: snap(at.x - ICON_SIZE / 2), y: snap(at.y - ICON_SIZE / 2) };
-  const box = (x: number, y: number): Box => ({ x: x - 24, y, width: ICON_SIZE + 48, height: ICON_SIZE + NAME_SPACE });
+  const [w, h] = size ? [size.w, size.h] : [ICON_SIZE, ICON_SIZE];
+  const start = { x: snap(at.x - w / 2), y: snap(at.y - h / 2) };
+  const box = (x: number, y: number): Box => (size ? { x, y, width: w, height: h } : { x: x - 24, y, width: ICON_SIZE + 48, height: ICON_SIZE + NAME_SPACE });
+  const [stepX, stepY] = size ? [snap(w + 40), snap(h + 40)] : [140, 130];
   for (let i = 0; i < 80; i++) {
-    const x = start.x + (i % 6) * 140;
-    const y = start.y + Math.floor(i / 6) * 130;
+    const x = start.x + (i % 6) * stepX;
+    const y = start.y + Math.floor(i / 6) * stepY;
     if (!taken.some((t) => overlaps(box(x, y), t, 16))) return { x, y };
   }
   return start;
@@ -129,31 +143,107 @@ export function freeSpot(at: { x: number; y: number }, diagram: Diagram): { x: n
 
 const OPPOSITE: Record<Side, Side> = { top: "bottom", bottom: "top", left: "right", right: "left" };
 
-/** draw.io's blue arrows: a copy of a component on one side, connected to it. */
-export function addConnected(fromId: string, side: Side, diagram: Diagram, actions: DiagramActions, kind: DiagramEdge["kind"]): string | null {
+/** Room a zone keeps around its contents: the title sits in the top margin. */
+const ZONE_PAD = { side: 30, top: 52, bottom: 36 };
+
+/**
+ * Add new nodes and edges. A zone that a new node sticks out of grows to hold it,
+ * and so on outward (draw.io's "extend parents"), as one undo step.
+ */
+export function putInside(fresh: DiagramNode[], edges: DiagramEdge[], diagram: Diagram, actions: DiagramActions): void {
+  const work = new Map(diagram.nodes.map((n) => [n.id, n]));
+  for (const n of fresh) work.set(n.id, n);
+  const changed = new Set(fresh.map((n) => n.id));
+  for (const n of fresh) {
+    let child = work.get(n.id)!;
+    while (child.parent) {
+      const zone = work.get(child.parent);
+      if (!zone || zone.kind !== "zone") break;
+      const f = footprint(child, work);
+      const z = absoluteBox(zone, work);
+      const left = Math.min(0, snap(f.x - ZONE_PAD.side - z.x));
+      const top = Math.min(0, snap(f.y - ZONE_PAD.top - z.y));
+      const right = Math.max(z.width, snap(f.x + f.width + ZONE_PAD.side - z.x));
+      const bottom = Math.max(z.height, snap(f.y + f.height + ZONE_PAD.bottom - z.y));
+      if (left === 0 && top === 0 && right === z.width && bottom === z.height) break;
+      work.set(zone.id, { ...zone, x: zone.x + left, y: zone.y + top, w: right - left, h: bottom - top });
+      changed.add(zone.id);
+      // Moving the zone's corner would carry its contents along; keep them in place.
+      if (left || top) {
+        for (const c of work.values()) {
+          if (c.parent !== zone.id) continue;
+          work.set(c.id, { ...c, x: c.x - left, y: c.y - top });
+          changed.add(c.id);
+        }
+      }
+      child = work.get(zone.id)!;
+    }
+  }
+  actions.put({ nodes: [...changed].map((id) => work.get(id)!), edges });
+}
+
+/** draw.io's blue arrows: a copy of a component or shape on one side, connected to it. */
+export function addConnected(fromId: string, side: Side, diagram: Diagram, actions: DiagramActions, style: ConnectorStyle): string | null {
   const byId = byIdOf(diagram);
   const from = byId.get(fromId);
-  if (!from || from.kind !== "component") return null;
-  const step = { right: [180, 0], left: [-180, 0], bottom: [0, 150], top: [0, -150] }[side];
-  const node: DiagramNode = {
-    id: newDiagramId(),
-    kind: "component",
-    x: snap(from.x + step[0]),
-    y: snap(from.y + step[1]),
-    parent: from.parent ?? null,
-    label: from.label,
-    type: from.type,
-    icon: from.icon,
-    origin: "user",
-    confidence: 1,
-  };
-  const edge: DiagramEdge = { id: newDiagramId(), source: from.id, target: node.id, sourceSide: side, targetSide: OPPOSITE[side], kind };
-  actions.put({ nodes: [node], edges: [edge] });
+  if (!connectable(from)) return null;
+  const base = { id: newDiagramId(), x: from.x, y: from.y, parent: from.parent ?? null, label: from.label, origin: "user" as const, confidence: 1 };
+  let node: DiagramNode =
+    from.kind === "component"
+      ? { ...base, kind: "component", type: from.type, icon: from.icon, tint: from.tint, frame: from.frame, tech: from.tech }
+      : { ...base, kind: "shape", shape: from.shape, w: from.w, h: from.h, style: from.style, type: from.type, tech: from.tech, z: from.z };
+  const { width, height } = footprint(from, byId);
+  const [dx, dy] = from.kind === "component" ? { right: [180, 0], left: [-180, 0], bottom: [0, 150], top: [0, -150] }[side] : {
+    right: [snap(width + 80), 0],
+    left: [-snap(width + 80), 0],
+    bottom: [0, snap(height + 60)],
+    top: [0, -snap(height + 60)],
+  }[side];
+  const taken = diagram.nodes.filter((n) => n.kind !== "zone").map((n) => footprint(n, byId));
+  // One step out, or further along when something is already there.
+  for (let i = 1; i <= 8; i++) {
+    node = { ...node, x: snap(from.x + dx * i), y: snap(from.y + dy * i) };
+    if (!taken.some((t) => overlaps(footprint(node, byId), t, 8))) break;
+  }
+  const edge: DiagramEdge = { id: newDiagramId(), source: from.id, target: node.id, ...style, sourceSide: side, targetSide: OPPOSITE[side] };
+  putInside([node], [edge], diagram, actions);
   return node.id;
 }
 
+/**
+ * Add a drawing (a template, a scratchpad entry) with fresh ids: its top-left at
+ * `at`, or to the right of what's on the canvas. Returns the new node ids.
+ */
+export function insertDiagram(fragment: Diagram, diagram: Diagram, actions: DiagramActions, at?: { x: number; y: number }): string[] {
+  const ids = new Map(fragment.nodes.map((n) => [n.id, newDiagramId()]));
+  const nodes: DiagramNode[] = fragment.nodes.map(({ legendFor: _legend, ...n }) => ({
+    ...n,
+    id: ids.get(n.id)!,
+    parent: n.parent && ids.has(n.parent) ? ids.get(n.parent)! : null,
+  }));
+  const edges: DiagramEdge[] = fragment.edges
+    .filter((e) => ids.has(e.source) && ids.has(e.target))
+    .map((e) => ({ ...e, id: newDiagramId(), source: ids.get(e.source)!, target: ids.get(e.target)!, steps: null }));
+  const bounds = contentBounds(diagram);
+  const placed = moveTo({ nodes, edges }, at ?? (bounds ? { x: bounds.x + bounds.width + 160, y: bounds.y } : { x: 40, y: 40 }));
+  actions.put(placed);
+  return placed.nodes.map((n) => n.id);
+}
+
+/** Bring the selection in front of everything, or send it behind (draw.io's Ctrl+Shift+F / B). */
+export function restack(ids: string[], to: "front" | "back", diagram: Diagram, actions: DiagramActions): void {
+  const picked = outermost(ids, diagram).sort((a, b) => (a.z ?? 0) - (b.z ?? 0));
+  if (picked.length === 0) return;
+  const zs = diagram.nodes.map((n) => n.z ?? 0);
+  let top = Math.max(0, ...zs);
+  let bottom = Math.min(0, ...zs);
+  // Keep the order the picked ones had among themselves.
+  const patches = to === "front" ? picked.map((n) => ({ id: n.id, patch: { z: ++top } })) : picked.reverse().map((n) => ({ id: n.id, patch: { z: --bottom } }));
+  actions.patchNodes(patches);
+}
+
 /** Shift top-level nodes (and routes) so the drawing's top-left lands at `to`. */
-function moveTo(fresh: Diagram, to: { x: number; y: number }): Diagram {
+export function moveTo(fresh: Diagram, to: { x: number; y: number }): Diagram {
   const top = fresh.nodes.filter((n) => !n.parent);
   const from = union(top.map((n) => ({ x: n.x, y: n.y, width: 1, height: 1 })));
   if (!from) return fresh;
@@ -225,7 +315,14 @@ export async function autoLayout(diagram: Diagram, actions: DiagramActions, syst
     }
     groups = zones.filter((z) => !z.parent && members.has(z.id)).map((z) => ({ id: z.id, kind: z.zone ?? "system", label: z.label, members: members.get(z.id)! }));
   }
-  const layout = await layoutGraph(graph, groups ? { groups } : { systemName });
+  // Shapes keep their size; components are icons.
+  const sizes = new Map(
+    graph.nodes.flatMap((g) => {
+      const n = byId.get(g.canvas_id!);
+      return n?.kind === "shape" ? [[g.id, { width: n.w ?? 120, height: n.h ?? 60 }] as const] : [];
+    }),
+  );
+  const layout = await layoutGraph(graph, groups ? { groups, sizes } : { systemName, sizes });
 
   // Keep the drawing where it was on the canvas.
   const before = union([...graph.nodes.map((g) => absoluteBox(byId.get(g.canvas_id!)!, byId)), ...zones.filter((z) => !z.parent).map((z) => absoluteBox(z, byId))]);
@@ -505,22 +602,4 @@ export function clearNumbers(diagram: Diagram, actions: DiagramActions): void {
     actions.remove({ nodes: diagram.nodes.filter((n) => n.legendFor).map((n) => n.id) });
     actions.patchEdges(diagram.edges.filter((e) => e.steps).map((e) => ({ id: e.id, patch: { steps: undefined } })));
   });
-}
-
-// --- exports ----------------------------------------------------------------------------
-
-/** Icon boxes in canvas coordinates, by graph node id, for the draw.io exporter. */
-export function exportBoxes(graph: Graph, diagram: Diagram): Map<string, Box> {
-  const byId = byIdOf(diagram);
-  const out = new Map<string, Box>();
-  for (const n of graph.nodes) {
-    const node = n.canvas_id ? byId.get(n.canvas_id) : undefined;
-    if (node) out.set(n.id, absoluteBox(node, byId));
-  }
-  return out;
-}
-
-export function exportZones(diagram: Diagram): DrawioZone[] {
-  const byId = byIdOf(diagram);
-  return diagram.nodes.filter((n) => n.kind === "zone").map((z) => ({ kind: z.zone ?? "system", label: z.label, box: absoluteBox(z, byId) }));
 }

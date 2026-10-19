@@ -15,7 +15,7 @@
     "dev:api": "cd api && uv run uvicorn stacksketch_api.main:serve --factory --reload --port 8000",
     "smoke": "cd apps/sync && npx tsx scripts/smoke.ts",
     "build": "npm run build -w @stacksketch/web",
-    "test": "npm test -w @stacksketch/graph && npm test -w @stacksketch/sync && cd api && uv run pytest -q",
+    "test": "npm test -w @stacksketch/graph && npm test -w @stacksketch/sync && npm test -w @stacksketch/web && cd api && uv run pytest -q",
     "typecheck": "npm run typecheck --workspaces --if-present"
   },
   "engines": {

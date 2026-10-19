@@ -198,12 +198,82 @@ class ChatTurn(BaseModel):
     text: str
 
 
+class ZoneInfo(BaseModel):
+    """A zone on the board (a group box) and the node ids inside it."""
+
+    label: str
+    members: list[str] = []
+
+
 class ChatRequest(BaseModel):
     graph: Graph
+    zones: list[ZoneInfo] = []
     findings: list[Finding] = []
     messages: list[ChatTurn]
+
+
+# --- board edits: changes the room AI makes to the diagram ---------------------------
+# The same shapes are the LLM's structured output and what /chat returns once every
+# id has been checked against the graph. The browser that asked applies them.
+
+
+class NewNode(BaseModel):
+    id: str = Field(description="A new kebab-case id that is not in the graph")
+    type: NodeType
+    label: str
+    tech: str | None
+    zone: str | None = Field(description="Name of an existing zone to put it in; null puts it beside what it connects to")
+
+
+class NodeChange(BaseModel):
+    id: str = Field(description="An existing node id")
+    label: str | None
+    type: NodeType | None
+    tech: str | None
+    replicas: int | None
+    dlq: bool | None
+
+
+class NewEdge(BaseModel):
+    from_node: str
+    to_node: str
+    kind: EdgeKind
+    protocol: str | None
+    endpoint: str | None
+    retry: bool | None
+    timeout_ms: int | None
+    hot_path: bool | None
+
+
+class EdgeChange(BaseModel):
+    id: str = Field(description='An existing edge id, "from->to"')
+    kind: EdgeKind | None
+    protocol: str | None
+    endpoint: str | None
+    retry: bool | None
+    timeout_ms: int | None
+    hot_path: bool | None
+
+
+class NewGroup(BaseModel):
+    label: str
+    members: list[str] = Field(description="Node ids, existing or new")
+
+
+class BoardEdits(BaseModel):
+    add_nodes: list[NewNode] = []
+    update_nodes: list[NodeChange] = []
+    remove_nodes: list[str] = []
+    add_edges: list[NewEdge] = []
+    update_edges: list[EdgeChange] = []
+    remove_edges: list[str] = []
+    groups: list[NewGroup] = []
+
+    def is_empty(self) -> bool:
+        return not any(getattr(self, f) for f in type(self).model_fields)
 
 
 class ChatResponse(BaseModel):
     reply: str
     llm: bool
+    edits: BoardEdits | None = None

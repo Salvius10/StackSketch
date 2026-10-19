@@ -6,8 +6,10 @@ import { XMLParser } from "fast-xml-parser";
 import { inflateSync, strFromU8 } from "fflate";
 import type { Box } from "./derive";
 import { inferNodeType, parseEdgeLabel, parseNodeLabel, slugify } from "./derive";
-import { ICON_SIZE, INK, iconFor, iconSvg } from "./icons";
+import { type ArrowKind, type Diagram, type DiagramEdge, type DiagramNode, type Side, nameDrop } from "./diagram";
+import { ICON_SIZE, INK, iconFor, iconOf, iconSvg } from "./icons";
 import type { ZoneKind } from "./layout";
+import { lookOf, rowsLayout, safeColour, shapeDef, shapeSvg, tableLayout } from "./shapes";
 import {
   type EdgeKind,
   type Graph,
@@ -157,6 +159,194 @@ export function toDrawio(graph: Graph, boxes: Map<string, Box> = new Map(), zone
   return (
     `<mxfile host="StackSketch" agent="StackSketch" version="1.0">\n` +
     `  <diagram id="stacksketch" name="Architecture">\n` +
+    `    <mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1654" pageHeight="1169" math="0" shadow="0">\n` +
+    `      <root>\n        ${cells.join("\n        ")}\n      </root>\n` +
+    `    </mxGraphModel>\n  </diagram>\n</mxfile>\n`
+  );
+}
+
+// --- the whole diagram ----------------------------------------------------------
+
+const DRAWIO_ARROW: Record<ArrowKind, string> = {
+  none: "none;",
+  arrow: "block;Fill=1;",
+  open: "open;Fill=0;",
+  triangle: "block;Fill=0;",
+  diamond: "diamond;Fill=1;",
+  "diamond-open": "diamond;Fill=0;",
+  circle: "oval;Fill=1;",
+  "er-one": "ERmandOne;Fill=0;",
+  "er-many": "ERmany;Fill=0;",
+  "er-zero-many": "ERzeroToMany;Fill=0;",
+  "er-one-many": "ERoneToMany;Fill=0;",
+  "er-zero-one": "ERzeroToOne;Fill=0;",
+};
+
+const arrowStyle = (end: "start" | "end", kind: ArrowKind | undefined, fallback: ArrowKind) => {
+  const [name, fill] = (DRAWIO_ARROW[kind ?? fallback] ?? DRAWIO_ARROW[fallback]).split(";");
+  return `${end}Arrow=${name};${fill ? `${end}${fill};` : ""}`;
+};
+
+const ANCHOR: Record<Side, string> = { top: "X=0.5;{}Y=0;", bottom: "X=0.5;{}Y=1;", left: "X=0;{}Y=0.5;", right: "X=1;{}Y=0.5;" };
+const anchor = (which: "exit" | "entry", side: Side | null | undefined) => (side ? `${which}${ANCHOR[side].replace("{}", which)}` : "");
+
+const html = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+const htmlLines = (s: string) => html(s).replace(/\n/g, "<br>");
+
+function rowsLabel(kind: "class" | "entity" | "list", label: string): string {
+  const layout = rowsLayout(kind, label);
+  const head = layout.head.map((l, i) => (i === layout.head.length - 1 ? `<b>${html(l)}</b>` : html(l))).join("<br>");
+  let out = `<p style="margin:0px;margin-top:4px;text-align:center;">${head}</p><hr size="1">`;
+  let lastY = layout.headH;
+  for (const row of layout.rows) {
+    // A separator between rows (a class's attributes and methods) sits in the gap before the row.
+    if (layout.lines.some((y) => y > lastY && y < row.y)) out += `<hr size="1">`;
+    out += `<p style="margin:0px;margin-left:6px;">${row.key ? `<b>${html(row.key)}</b>&nbsp;&nbsp;` : ""}${html(row.text)}</p>`;
+    lastY = row.y;
+  }
+  return out;
+}
+
+function tableLabel(label: string): string {
+  const { cells, cols } = tableLayout(label, 1, 1);
+  const rows = cells.map((r, i) => `<tr>${Array.from({ length: cols }, (_, c) => `<td>${i === 0 ? `<b>${html(r[c] ?? "")}</b>` : html(r[c] ?? "")}</td>`).join("")}</tr>`);
+  return `<table border="1" cellpadding="4" style="width:100%;height:100%;border-collapse:collapse;">${rows.join("")}</table>`;
+}
+
+/** A node's draw.io style and label. */
+function vertex(n: DiagramNode, w: number, h: number): { style: string; label: string } {
+  if (n.kind === "component") {
+    const label = n.tech ? `${html(n.label)}<br><font style="font-size:10px;color:${MUTED}">${html(n.tech)}</font>` : html(n.label);
+    return {
+      style:
+        "shape=image;html=1;imageAspect=0;aspect=fixed;verticalLabelPosition=bottom;verticalAlign=top;" +
+        `labelPosition=center;align=center;fontSize=12;fontColor=${INK};image=data:image/svg+xml,${btoa(iconSvg(iconOf(n)))};`,
+      label,
+    };
+  }
+  if (n.kind === "note") {
+    return { style: "text;html=1;whiteSpace=wrap;align=left;verticalAlign=top;spacingLeft=8;fillColor=#FFFFFF;strokeColor=#D5DBDB;rounded=1;arcSize=4;", label: htmlLines(n.label) };
+  }
+  const look = lookOf(n.style, n.kind === "shape" ? shapeDef(n.shape) : null);
+  const colours = (fill: string) =>
+    `fillColor=${fill};strokeColor=${look.stroke};fontColor=${look.fontColor};fontSize=${look.fontSize};strokeWidth=${look.strokeWidth};` +
+    `fontStyle=${(look.bold ? 1 : 0) + (look.italic ? 2 : 0) + (look.underline ? 4 : 0)};` +
+    (look.dashed ? "dashed=1;" : "") +
+    (look.opacity < 1 ? `opacity=${Math.round(look.opacity * 100)};` : "");
+  if (n.kind === "zone") {
+    const z = n.zone ?? "system";
+    const custom = n.style?.fill || n.style?.stroke || n.style?.dashed !== undefined;
+    const base = custom ? colours(safeColour(n.style?.fill, "none")).replace(/fontSize=\d+;/, "fontSize=13;") : ZONE_STYLES[z];
+    const kind =
+      n.shape === "swimlane"
+        ? "swimlane;horizontal=0;startSize=30;whiteSpace=wrap;html=1;container=1;collapsible=0;"
+        : "rounded=0;whiteSpace=wrap;html=1;container=1;collapsible=0;pointerEvents=0;verticalAlign=top;align=left;spacingLeft=12;spacingTop=6;";
+    return { style: `${kind}fontSize=13;fontColor=${INK};${base}`, label: html(n.label) };
+  }
+  const def = shapeDef(n.shape);
+  const fill = def.solid ? look.stroke : look.fill;
+  const text = `align=${look.align};verticalAlign=${look.valign};`;
+  if (def.rows === "table") return { style: `html=1;whiteSpace=wrap;overflow=fill;${colours(fill)}`, label: tableLabel(n.label) };
+  if (def.rows) return { style: `verticalAlign=top;align=left;overflow=fill;html=1;whiteSpace=wrap;${colours(fill)}`, label: rowsLabel(def.rows, n.label) };
+  const label = def.label === "none" ? "" : htmlLines(n.label);
+  const below = def.label === "below" ? "verticalLabelPosition=bottom;verticalAlign=top;labelPosition=center;align=center;" : "";
+  if (def.drawio) return { style: `${def.drawio}${below || text}${colours(fill)}`, label };
+  // No draw.io shape draws this one: embed the outline as a picture, keeping the text editable.
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" overflow="visible">${shapeSvg(def, w, h, look, n.label)}</svg>`;
+  return { style: `shape=image;html=1;imageAspect=0;whiteSpace=wrap;${below || text}fontColor=${look.fontColor};fontSize=${look.fontSize};image=data:image/svg+xml,${btoa(svg)};`, label };
+}
+
+/** A connector's draw.io style; `from` and `to` are its ends, whose names a line going down should pass under. */
+function connector(e: DiagramEdge, from: DiagramNode, to: DiagramNode): string {
+  const kind = e.kind ?? "sync";
+  const stroke = safeColour(e.stroke, INK);
+  const line = e.line === "straight" ? "edgeStyle=none;" : e.line === "curved" ? "edgeStyle=none;curved=1;" : "edgeStyle=orthogonalEdgeStyle;";
+  return (
+    `${line}rounded=0;html=1;strokeColor=${stroke};fontSize=11;fontColor=${MUTED};labelBackgroundColor=#ffffff;` +
+    (kind === "async" ? "dashed=1;" : kind === "stream" ? "dashed=1;dashPattern=1 4;" : "") +
+    `strokeWidth=${e.width ?? (e.hot_path ? 2 : 1)};` +
+    arrowStyle("end", e.endArrow, "arrow") +
+    arrowStyle("start", e.startArrow, "none") +
+    anchor("exit", e.sourceSide) +
+    anchor("entry", e.targetSide) +
+    (e.sourceSide === "bottom" && nameDrop(from) ? `exitDy=${nameDrop(from)};` : "") +
+    (e.targetSide === "bottom" && nameDrop(to) ? `entryDy=${nameDrop(to)};` : "")
+  );
+}
+
+/**
+ * The whole diagram as a .drawio file: shapes as draw.io's own shapes, zones as
+ * containers, connectors with their arrowheads. What the reviewer knows about a
+ * component or connector rides along as ss_ properties, as in `toDrawio`.
+ */
+export function diagramToDrawio(diagram: Diagram, graph?: Graph): string {
+  const byId = new Map(diagram.nodes.map((n) => [n.id, n]));
+  const depth = (n: DiagramNode) => {
+    let d = 0;
+    for (let p = n.parent ? byId.get(n.parent) : undefined; p && d < 50; p = p.parent ? byId.get(p.parent) : undefined) d++;
+    return d;
+  };
+  // Parents before children, and the stacking order within each level.
+  const ordered = [...diagram.nodes].sort((a, b) => depth(a) - depth(b) || (a.kind === "zone" ? 0 : 1) - (b.kind === "zone" ? 0 : 1) || (a.z ?? 0) - (b.z ?? 0));
+  const cellId = new Map(ordered.map((n, i) => [n.id, `ss-${i + 1}`]));
+  const graphNode = new Map((graph?.nodes ?? []).filter((n) => n.canvas_id).map((n) => [n.canvas_id!, n]));
+  const graphEdge = new Map((graph?.edges ?? []).filter((e) => e.canvas_id).map((e) => [e.canvas_id!, e]));
+  const cells: string[] = ['<mxCell id="0"/>', '<mxCell id="1" parent="0"/>'];
+
+  for (const n of ordered) {
+    const id = cellId.get(n.id)!;
+    const parent = n.parent && cellId.has(n.parent) ? cellId.get(n.parent)! : "1";
+    const w = n.kind === "component" ? ICON_SIZE : (n.w ?? ICON_SIZE);
+    const h = n.kind === "component" ? ICON_SIZE : (n.h ?? ICON_SIZE);
+    const { style, label } = vertex(n, w, h);
+    const g = graphNode.get(n.id);
+    const custom = attrs({
+      id,
+      label,
+      ...(n.kind === "zone" ? { ss_role: "zone", ss_zone: n.zone ?? "system" } : {}),
+      ...(g
+        ? { ss_id: g.id, ss_type: g.type, ss_tech: g.tech, ss_replicas: g.replicas, ss_dlq: g.dlq, ss_source: g.source, ss_confidence: g.confidence }
+        : {}),
+    });
+    cells.push(
+      `<object ${custom}><mxCell style="${esc(style)}" vertex="1" parent="${parent}">` +
+        `<mxGeometry x="${Math.round(n.x)}" y="${Math.round(n.y)}" width="${Math.round(w)}" height="${Math.round(h)}" as="geometry"/>` +
+        `</mxCell></object>`,
+    );
+  }
+
+  diagram.edges.forEach((e, i) => {
+    const source = cellId.get(e.source);
+    const target = cellId.get(e.target);
+    if (!source || !target) return;
+    const g = graphEdge.get(e.id);
+    const custom = attrs({
+      id: `ss-e-${i + 1}`,
+      label: html(e.label?.trim() || e.endpoint || e.protocol || ""),
+      ...(g
+        ? {
+            ss_id: g.id,
+            ss_kind: g.kind,
+            ss_protocol: g.protocol,
+            ss_endpoint: g.endpoint,
+            ss_retry: g.retry,
+            ss_timeout_ms: g.timeout_ms,
+            ss_hot_path: g.hot_path,
+            ss_source: g.source,
+            ss_confidence: g.confidence,
+          }
+        : {}),
+    });
+    const waypoints = (e.points ?? []).slice(1, -1);
+    const geometry = waypoints.length
+      ? `<mxGeometry relative="1" as="geometry"><Array as="points">${waypoints.map((p) => `<mxPoint x="${Math.round(p.x)}" y="${Math.round(p.y)}"/>`).join("")}</Array></mxGeometry>`
+      : `<mxGeometry relative="1" as="geometry"/>`;
+    cells.push(`<object ${custom}><mxCell style="${esc(connector(e, byId.get(e.source)!, byId.get(e.target)!))}" edge="1" parent="1" source="${source}" target="${target}">${geometry}</mxCell></object>`);
+  });
+
+  return (
+    `<mxfile host="StackSketch" agent="StackSketch" version="1.0">\n` +
+    `  <diagram id="stacksketch" name="Diagram">\n` +
     `    <mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1654" pageHeight="1169" math="0" shadow="0">\n` +
     `      <root>\n        ${cells.join("\n        ")}\n      </root>\n` +
     `    </mxGraphModel>\n  </diagram>\n</mxfile>\n`

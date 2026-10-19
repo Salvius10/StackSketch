@@ -33,40 +33,54 @@ The API logs which provider and model it is using when it starts, and `GET :8000
 Everything reads or writes **one typed graph** of components and connections, kept in one shared Yjs document per board.
 
 ```
- browser (Next.js + Excalidraw)          sync server (Hocuspocus)              API (FastAPI)
+ browser (Next.js + React Flow)          sync server (Hocuspocus)              API (FastAPI)
  ┌──────────────────────────┐   Yjs   ┌───────────────────────────────┐ HTTP ┌─────────────────────┐
- │ canvas elements ─────────┼────────►│ derive graph from elements    │─────►│ rule checks         │
- │ inspector / answers      │         │ review after a pause in edits │      │ LLM layer           │
+ │ diagram: shapes, zones, ─┼────────►│ derive graph from the diagram │─────►│ rule checks         │
+ │ connectors, answers      │         │ review after a pause in edits │      │ LLM layer           │
  │ findings, pins, flows ◄──┼─────────│ write findings + questions    │◄─────│ explainer, compose  │
  └──────────────────────────┘         │ answer room chat              │      └─────────────────────┘
             │  /api proxy (explain, generate, import)                 │ SQLite: docs + review log
             └─────────────────────────────────────────────────────────┘
 ```
 
-- The browser only writes canvas elements, votes, dismissed questions, flows and chat into the document.
+- The browser only writes the diagram (components, zones, notes, connectors), votes, dismissed questions, flows and chat into the document.
 - The sync server is the single writer of the graph and the findings, so every user sees the same flags. It derives the graph about 150 ms after an edit, runs the rules about 1.2 s after edits stop, and asks the LLM layer to refine them (at most every 15 s per board).
 - The API is stateless: every request carries the graph it is about.
+
+### The editor
+
+The editor works like draw.io:
+
+- **Shape library** on the left: drag a shape onto the canvas (or into a zone), or click it to add it in view. Search filters it.
+- **Connecting**: hover a component and drag from one of its blue connection points to another component. Dropping on empty canvas offers a list of components to add, already connected. The blue arrows beside a selected component add a connected copy on that side.
+- **Zones** are containers: drop shapes into a zone to put them inside, drag them out to take them out, and move the zone to move its contents. A zone grows when something added to it doesn't fit. Ctrl+G puts the selection in a new zone.
+- **Format panel** on the right shows what can be set on the selection: a component's name, type, icon, technology and replicas; a connector's kind, label, protocol, endpoint, timeout, retry and hot path; alignment and distribution for several shapes.
+- **Menus and toolbar**: File (new board, import, export as PNG, SVG, draw.io, Mermaid or JSON), Edit, View, Arrange (auto layout, zones, align, distribute) and AI (idea → architecture, review, flows, room chat). Press `?` for the keyboard shortcuts.
+- **Undo and redo** (Ctrl+Z, Ctrl+Y) only touch your own edits, never a teammate's.
+- **Request flows** (Flow tab): select a component and pick a request into it. The view frames the flow and fades everything it doesn't touch; a numbered marker travels each connector, lighting it up blue for a request that waits, orange for a message that doesn't, purple for a stream and green for the reply coming back. The components it leaves and reaches get a ring, and the view follows it if it goes off-screen. A card at the foot of the canvas shows the hop, what happens and play, pause, step and close; the panel lists the steps as a timeline (click one to jump there) with Slow / Normal / Fast speeds.
+- **The room AI can draw**: ask it in the Chat tab to add, connect, rename, group, remove or fix things ("add a Redis cache for the app server", "fix the findings", or "draw a serverless image pipeline" on an empty board). Its reply lists the edits by graph id; the API drops any that don't fit the graph, and the tab that asked places them beside what they connect to and applies them as one step. The reply then says what changed, with Undo (anyone in the room can use it, also after a reload) and Show. Retry, timeout and hot-path values are kept only when the message or an open finding mentions them, so the reviewer still asks about the rest.
+
+Boards drawn in the earlier Excalidraw-based editor are converted when they are first opened. The old elements stay in the document.
 
 ### Diagram style
 
 Components are drawn the way reference architectures are: an icon tile in the component's category colour (compute orange, networking purple, data magenta, storage green, integration pink, security red) with its name and technology underneath. Users, clients and outside services are plain line icons. The icon follows the type and the technology: a database labelled `S3` is a bucket, a queue on `Kafka` is a stream, an outside service called `Stripe` is a card, `SendGrid` an envelope. The icons are StackSketch's own SVGs, so exports look the same everywhere.
 
-- **Connectors** are right-angle arrows bound to the icons, so they re-route when you move a component. Anything you draw by hand defaults to the same look: straight lines, a sans font, elbow arrows.
+- **Connectors** are right-angle arrows attached to the components' sides, so they re-route when you move a component.
 - **Zones** box in the clients, the system (titled with the board name) and external services when a graph is laid out.
-- **Tidy up** redraws a sketched board in this style with a fresh layout. Names, labels and inspector fields carry over, the reviewer's findings stay attached, and Ctrl+Z puts the old drawing back.
+- **Auto layout** (Ctrl+Shift+L) lays the whole board out again in this style. Your zones, names and fields carry over, the reviewer's findings stay attached, and Ctrl+Z puts the old layout back.
 - **Numbered steps**: after explaining a request flow, *Number steps on diagram* puts a numbered badge on each hop and lists the steps beside the drawing.
 
-### Drawing → graph
+### Diagram → graph
 
 | On the canvas | In the graph |
 | --- | --- |
-| An icon from the bar, or a sketched rectangle, ellipse or diamond | a node; its type comes from the palette, the inspector, or keywords in the name (`Postgres` → database, `Kafka` → queue …) |
-| Name `Orders DB` + second line `Postgres` | `label: "Orders DB"`, `tech: "Postgres"`; `x3` in the name sets `replicas: 3` |
-| Solid / dashed / dotted arrow | `sync` / `async` / `stream` edge |
-| Arrow label `POST /checkout timeout 2s retry hot` | `protocol: REST`, `endpoint`, `timeout_ms: 2000`, `retry: true`, `hot_path: true` |
-| Inspector edits | stored on the element (`customData.stacksketch`), so they survive copy and paste |
+| A component from the library | a node; its type comes from the shape, the Format panel, or keywords in the name (`Postgres` → database, `Kafka` → queue …) |
+| Name `Orders DB`, technology `Postgres`, replicas `3` | `label: "Orders DB"`, `tech: "Postgres"`, `replicas: 3` |
+| Solid / dashed / dotted connector | `sync` / `async` / `stream` edge |
+| Connector label `POST /checkout timeout 2s retry hot` | `protocol: REST`, `endpoint`, `timeout_ms: 2000`, `retry: true`, `hot_path: true`; fields set in the Format panel win over the label |
 
-Freehand strokes snap: a closed stroke becomes a component (a box suggests a service, a circle a database, a diamond a gateway, and naming it settles the type), and a stroke drawn from one component to another becomes a connector. Unknown fields stay `null`. Every node and edge records its `source` (user, infra, code, ai) and `confidence`.
+Unknown fields stay `null`. Every node and edge records its `source` (user, infra, code, ai) and `confidence`.
 
 ### Reviewer
 
@@ -89,8 +103,8 @@ The LLM layer rewrites each finding for this design and adds up to 3 judgement c
 
 | Path | What |
 | --- | --- |
-| `packages/graph` | shared TypeScript: schema, canvas → graph derivation, diff, component icons, Mermaid and draw.io export, draw.io import, zoned ELK layout, snap geometry, Yjs document layout |
-| `apps/web` | Next.js + Excalidraw: board, diagram rendering (icons, connectors, zones, tidy up, numbered steps), Yjs binding, overlay (pins, type badges, flow animation), panels |
+| `packages/graph` | shared TypeScript: schema, the diagram model and diagram → graph derivation, conversion of old Excalidraw boards, diff, component icons, Mermaid and draw.io export, draw.io import, zoned ELK layout, Yjs document layout |
+| `apps/web` | Next.js + React Flow (`@xyflow/react`): the editor (shape library, menus, toolbar, format panel, zones, quick-add, auto layout, numbered steps, SVG/PNG export), Yjs binding with per-user undo, review, flow and chat panels |
 | `apps/sync` | Hocuspocus server: persistence (SQLite), graph derivation, reviewer orchestration, room chat; `scripts/smoke.ts` is an end-to-end check |
 | `api` | FastAPI: rules, LLM layer, explainer, docker-compose ingestion; `spike/` is the Phase 0 harness |
 
@@ -125,7 +139,7 @@ The API and the sync server read `.env` at the repo root (see `.env.example`); v
 | Phase | State |
 | --- | --- |
 | 0. Spike | Harness ready: `cd api && uv run python spike/sketch_to_graph.py <folder>` scores sketch images against expected graph JSON. Needs your 10 sketches and a key. |
-| 1. Canvas + graph | Done: Excalidraw, typed palette, snap-to-shape, typed arrows, graph in the Yjs doc, live graph view. |
+| 1. Canvas + graph | Done: draw.io-style editor on React Flow (shape library, connection points, zones as containers, format panel, per-user undo), graph in the Yjs doc, live graph view. Old Excalidraw boards convert on first open. |
 | 2. Reviewer | Done: 8 rules, batched questions, LLM refinement, pins on canvas, useful / not useful votes. |
 | 3. Explainer | Done: entry points, call/return walk, sync vs async animation, template or AI narration, saved flows. |
 | 4. Export + idea → architecture | Done: draw.io (icons in zone containers), Mermaid, PNG (2×), SVG, JSON export; draw.io, docker-compose and JSON import; idea → graph → zoned ELK layout. |

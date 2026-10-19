@@ -126,12 +126,12 @@ def create_app(llm: LLM | None = None) -> FastAPI:
     async def chat(body: ChatRequest, request: Request) -> ChatResponse:
         llm = get_llm(request)
         try:
-            reply = await llm.chat(body.graph, body.findings, body.messages)
+            reply, edits = await llm.chat(body.graph, body.findings, body.messages, body.zones)
         except LLMUnavailable as e:
             raise HTTPException(503, str(e)) from e
         except ValueError as e:
             raise HTTPException(422, str(e)) from e
-        return ChatResponse(reply=reply, llm=True)
+        return ChatResponse(reply=reply, llm=True, edits=None if edits.is_empty() else edits)
 
     return app
 
